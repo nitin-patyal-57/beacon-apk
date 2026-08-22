@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.walnut.beaconfinder.data.ble.BleConnectionManager
 import com.walnut.beaconfinder.data.ble.BleScannerManager
+import com.walnut.beaconfinder.data.ble.BluetoothStateObserver
 import com.walnut.beaconfinder.data.model.BeaconDevice
 import com.walnut.beaconfinder.data.model.BeaconProtocol
 import com.walnut.beaconfinder.data.model.ConnectionState
@@ -20,6 +21,8 @@ import com.walnut.beaconfinder.data.processing.TtsManager
 import com.walnut.beaconfinder.data.repository.CustomFormatRepository
 import com.walnut.beaconfinder.data.repository.KnownBeaconRepository
 import com.walnut.beaconfinder.data.repository.SettingsRepository
+import com.walnut.beaconfinder.service.BackgroundScanService
+import com.walnut.beaconfinder.service.ScanWatchdogReceiver
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -39,7 +42,8 @@ class ScannerViewModel @Inject constructor(
     private val presenceTracker: BeaconPresenceTracker,
     private val cooldownTracker: CooldownTracker,
     private val nearestBeaconTracker: NearestBeaconTracker,
-    private val ttsManager: TtsManager
+    private val ttsManager: TtsManager,
+    private val bluetoothStateObserver: BluetoothStateObserver
 ) : AndroidViewModel(application) {
 
     private val _selectedFilter = MutableStateFlow(BeaconProtocolFilter.ALL)
@@ -48,7 +52,7 @@ class ScannerViewModel @Inject constructor(
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    private val _sortOption = MutableStateFlow(SortOption.RSSI_DESC)
+    private val _sortOption = MutableStateFlow(SortOption.LAST_SEEN)
     val sortOption: StateFlow<SortOption> = _sortOption.asStateFlow()
 
     private val _autoConnectEnabled = MutableStateFlow(true)
@@ -57,44 +61,12 @@ class ScannerViewModel @Inject constructor(
     private val _lastConnectedBeacon = MutableStateFlow<BeaconDevice?>(null)
     val lastConnectedBeacon: StateFlow<BeaconDevice?> = _lastConnectedBeacon.asStateFlow()
 
-    val devices: StateFlow<List<BeaconDevice>> = combine(
-        scannerManager.devices,
-        _selectedFilter,
-        _searchQuery,
-        _sortOption,
-        connectionManager.connectionState
-    ) { values ->
-        @Suppress("UNCHECKED_CAST")
-        val deviceMap = values[0] as Map<String, BeaconDevice>
-        val filter = values[1] as BeaconProtocolFilter
-        val query = values[2] as String
-        val sort = values[3] as SortOption
-        val connStates = values[4] as Map<String, ConnectionState>
+    private val _excludedAddresses = MutableStateFlow<Set<String>>(emptySet())
 
-        var list = deviceMap.values.map { device ->
-            device.copy(connectionState = connStates[device.address] ?: device.connectionState)
-        }
-
-        if (filter != BeaconProtocolFilter.ALL) {
-            list = list.filter { it.protocol == filter.protocol }
-        }
-
-        if (query.isNotBlank()) {
-            list = list.filter {
-                it.displayName.contains(query, ignoreCase = true) ||
-                        it.address.contains(query, ignoreCase = true)
-            }
-        }
-
-        list = when (sort) {
-            SortOption.RSSI_DESC -> list.sortedBy { it.rssi }
-            SortOption.RSSI_ASC -> list.sortedByDescending { it.rssi }
-            SortOption.NAME -> list.sortedBy { it.displayName }
-            SortOption.LAST_SEEN -> list.sortedByDescending { it.lastSeen }
-        }
-
-        list
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    private val _devices = MutableStateFlow(DeviceListWrapper(emptyList()))
+    val devices: StateFlow<List<BeaconDevice>> = _devices.map { it.devices }.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+    )
 
     val isScanning: StateFlow<Boolean> = scannerManager.isScanning
     val scanError: StateFlow<String?> = scannerManager.scanError
@@ -102,13 +74,29 @@ class ScannerViewModel @Inject constructor(
     private val rssiProcessors = mutableMapOf<String, RssiProcessor>()
     private val packetHistoryStores = mutableMapOf<String, PacketHistoryStore>()
     private var proximityJob: Job? = null
+    private var refreshJob: Job? = null
 
     init {
         ttsManager.init()
         nearestBeaconTracker.setEnabled(true)
 
+        nearestBeaconTracker.setOnOutOfRangeConfirmedListener { address ->
+            _excludedAddresses.value = _excludedAddresses.value + address
+        }
+
         nearestBeaconTracker.setOnNearestBeaconFoundListener { device ->
             _lastConnectedBeacon.value = device
+            _excludedAddresses.value = _excludedAddresses.value - device.address
+        }
+
+        viewModelScope.launch {
+            bluetoothStateObserver.btTurnedOn.collect {
+                if (!settingsRepo.monitoringEnabled.value && !scannerManager.isScanning.value) {
+                    Log.d(TAG, "BT turned on → auto-starting foreground scan")
+                    delay(1000)
+                    startScan()
+                }
+            }
         }
 
         viewModelScope.launch {
@@ -125,13 +113,34 @@ class ScannerViewModel @Inject constructor(
     }
 
     fun startScan() {
+        nearestBeaconTracker.reset()
+        rssiProcessors.clear()
+        packetHistoryStores.clear()
+        _excludedAddresses.value = emptySet()
         scannerManager.startScan()
         startProximityTracking()
+        startAutoRefresh()
+
+        val app = getApplication<Application>()
+        app.getSharedPreferences("beacon_finder_prefs", android.content.Context.MODE_PRIVATE)
+            .edit().putBoolean("background_monitoring_enabled", true).apply()
+        settingsRepo.setMonitoringEnabled(true)
+        ScanWatchdogReceiver.schedule(app)
+        BackgroundScanService.start(app)
     }
 
     fun stopScan() {
         scannerManager.stopScan()
         stopProximityTracking()
+        stopAutoRefresh()
+        restartBackgroundIfNeeded()
+    }
+
+    private fun restartBackgroundIfNeeded() {
+        if (settingsRepo.monitoringEnabled.value) {
+            Log.d(TAG, "Foreground scan stopped → restarting background scan")
+            BackgroundScanService.start(getApplication())
+        }
     }
 
     fun toggleAutoConnect() {
@@ -147,12 +156,10 @@ class ScannerViewModel @Inject constructor(
     private fun startProximityTracking() {
         proximityJob?.cancel()
         proximityJob = viewModelScope.launch {
-            delay(2000)
             while (true) {
                 delay(PROXIMITY_CHECK_INTERVAL_MS)
                 val deviceMap = scannerManager.devices.value
                 val allDevices = deviceMap.values.toList()
-                allDevices.forEach { nearestBeaconTracker.processDevice(it) }
                 nearestBeaconTracker.checkAndAnnounce(allDevices)
             }
         }
@@ -163,18 +170,80 @@ class ScannerViewModel @Inject constructor(
         proximityJob = null
     }
 
+    private fun startAutoRefresh() {
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            while (true) {
+                delay(AUTO_REFRESH_INTERVAL_MS)
+                emitDeviceList()
+            }
+        }
+    }
+
+    private fun emitDeviceList() {
+        val filter = _selectedFilter.value
+        val query = _searchQuery.value
+        val sort = _sortOption.value
+        val connStates = connectionManager.connectionState.value
+
+        var list = scannerManager.getDevicesInOrder()
+            .filter { it.address !in _excludedAddresses.value }
+            .map { device ->
+                val connState = connStates[device.address] ?: device.connectionState
+                if (connState != device.connectionState) device.copy(connectionState = connState) else device
+            }
+
+        if (filter != BeaconProtocolFilter.ALL) {
+            list = list.filter { it.protocol == filter.protocol }
+        }
+
+        if (query.isNotBlank()) {
+            list = list.filter {
+                it.displayName.contains(query, ignoreCase = true) ||
+                        it.address.contains(query, ignoreCase = true)
+            }
+        }
+
+        if (sort != SortOption.LAST_SEEN) {
+            list = when (sort) {
+                SortOption.RSSI_DESC -> list.sortedBy { it.rssi }
+                SortOption.RSSI_ASC -> list.sortedByDescending { it.rssi }
+                SortOption.NAME -> list.sortedBy { it.displayName }
+                else -> list
+            }
+        }
+
+        val current = _devices.value.devices
+        val currentMap = current.associateBy { it.address }
+        val changed = list.size != current.size || list.any { device ->
+            val old = currentMap[device.address]
+            old == null || old.rssi != device.rssi || old.connectionState != device.connectionState || old.isInRange != device.isInRange
+        }
+        if (changed) {
+            _devices.value = DeviceListWrapper(list)
+        }
+    }
+
+    private fun stopAutoRefresh() {
+        refreshJob?.cancel()
+        refreshJob = null
+    }
+
     fun clearDevices() = scannerManager.clearDevices()
 
     fun setFilter(filter: BeaconProtocolFilter) {
         _selectedFilter.value = filter
+        emitDeviceList()
     }
 
     fun setSearchQuery(query: String) {
         _searchQuery.value = query
+        emitDeviceList()
     }
 
     fun setSortOption(option: SortOption) {
         _sortOption.value = option
+        emitDeviceList()
     }
 
     fun getDevice(address: String): BeaconDevice? = scannerManager.getDevice(address)
@@ -190,20 +259,30 @@ class ScannerViewModel @Inject constructor(
     }
 
     fun speakBeaconName(device: BeaconDevice) {
-        val name = device.name ?: when (device.protocol) {
-            BeaconProtocol.IBEACON -> "iBeacon ${device.iBeaconUuid?.take(8)}, Major ${device.iBeaconMajor}, Minor ${device.iBeaconMinor}"
-            BeaconProtocol.EDDYSTONE_UID -> "Eddystone UID ${device.eddystoneNamespace?.take(10)}"
-            BeaconProtocol.EDDYSTONE_URL -> "Eddystone URL ${device.eddystoneUrl}"
-            else -> device.address
+        val name = device.name?.takeIf { it.isNotBlank() } ?: when (device.protocol) {
+            BeaconProtocol.IBEACON -> "Unknown iBeacon"
+            BeaconProtocol.EDDYSTONE_UID -> "Unknown Eddystone"
+            BeaconProtocol.EDDYSTONE_URL -> "Unknown Eddystone"
+            else -> "Unknown beacon"
         }
         ttsManager.speak(name)
     }
 
     fun getRssiProcessor(address: String): RssiProcessor {
+        if (rssiProcessors.size >= MAX_DEVICE_HISTORY && !rssiProcessors.containsKey(address)) {
+            rssiProcessors.entries.iterator().let { iter ->
+                if (iter.hasNext()) { iter.next(); iter.remove() }
+            }
+        }
         return rssiProcessors.getOrPut(address) { RssiProcessor() }
     }
 
     fun getPacketHistory(address: String): PacketHistoryStore {
+        if (packetHistoryStores.size >= MAX_DEVICE_HISTORY && !packetHistoryStores.containsKey(address)) {
+            packetHistoryStores.entries.iterator().let { iter ->
+                if (iter.hasNext()) { iter.next(); iter.remove() }
+            }
+        }
         return packetHistoryStores.getOrPut(address) { PacketHistoryStore() }
     }
 
@@ -215,9 +294,11 @@ class ScannerViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        ttsManager.stop()
         nearestBeaconTracker.setEnabled(false)
         stopProximityTracking()
+        stopAutoRefresh()
+        ttsManager.stop()
+        restartBackgroundIfNeeded()
         super.onCleared()
     }
 
@@ -230,7 +311,9 @@ class ScannerViewModel @Inject constructor(
 
     companion object {
         private const val TAG = "ScannerViewModel"
-        private const val PROXIMITY_CHECK_INTERVAL_MS = 2000L
+        private const val PROXIMITY_CHECK_INTERVAL_MS = 1000L
+        private const val AUTO_REFRESH_INTERVAL_MS = 200L
+        private const val MAX_DEVICE_HISTORY = 50
     }
 }
 
@@ -240,9 +323,7 @@ enum class BeaconProtocolFilter(val protocol: BeaconProtocol?, val label: String
     EDDYSTONE_UID(BeaconProtocol.EDDYSTONE_UID, "Eddystone UID"),
     EDDYSTONE_URL(BeaconProtocol.EDDYSTONE_URL, "Eddystone URL"),
     EDDYSTONE_TLM(BeaconProtocol.EDDYSTONE_TLM, "Eddystone TLM"),
-    EDDYSTONE_EID(BeaconProtocol.EDDYSTONE_EID, "Eddystone EID"),
-    CUSTOM_BLE(BeaconProtocol.CUSTOM_BLE, "Custom"),
-    GENERIC_BLE(BeaconProtocol.GENERIC_BLE, "Generic")
+    EDDYSTONE_EID(BeaconProtocol.EDDYSTONE_EID, "Eddystone EID")
 }
 
 enum class SortOption(val label: String) {
@@ -251,3 +332,5 @@ enum class SortOption(val label: String) {
     NAME("Name"),
     LAST_SEEN("Last Seen")
 }
+
+class DeviceListWrapper(val devices: List<BeaconDevice>)

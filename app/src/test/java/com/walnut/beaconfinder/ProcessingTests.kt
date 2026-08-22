@@ -1,12 +1,17 @@
 package com.walnut.beaconfinder
 
+import android.content.Context
 import com.walnut.beaconfinder.data.processing.DistanceCalculator
 import com.walnut.beaconfinder.data.processing.RssiProcessor
 import com.walnut.beaconfinder.data.processing.CooldownTracker
 import com.walnut.beaconfinder.data.processing.BeaconPresenceTracker
+import com.walnut.beaconfinder.data.processing.NearestBeaconTracker
+import com.walnut.beaconfinder.data.processing.TtsManager
 import com.walnut.beaconfinder.data.model.BeaconDevice
 import com.walnut.beaconfinder.data.model.BeaconProtocol
 import com.walnut.beaconfinder.data.model.PresenceState
+import io.mockk.MockKAnnotations
+import io.mockk.impl.annotations.MockK
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
@@ -183,4 +188,130 @@ class ProcessingTests {
         iBeaconMinor = 1,
         rssi = -50
     )
+
+    // ==================== NearestBeaconTracker Hybrid (Packet + RSSI) Tests ====================
+
+    @MockK lateinit var mockContext: Context
+    @MockK lateinit var mockTts: TtsManager
+    private lateinit var tracker: NearestBeaconTracker
+
+    @Before
+    fun setupTrackerTests() {
+        MockKAnnotations.init(this)
+        tracker = NearestBeaconTracker(mockContext, mockTts)
+        tracker.setEnabled(true)
+    }
+
+    private fun createBeacon(address: String, rssi: Int) = BeaconDevice(
+        address = address,
+        protocol = BeaconProtocol.IBEACON,
+        iBeaconUuid = "12345678-1234-1234-1234-123456789ABC",
+        iBeaconMajor = 1,
+        iBeaconMinor = 1,
+        rssi = rssi
+    )
+
+    @Test
+    fun `initial state is OUTSIDE`() {
+        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+    }
+
+    @Test
+    fun `packet with RSSI >= -80 transitions to IN_RANGE`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val result = tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+        assertNotNull(result)
+    }
+
+    @Test
+    fun `packet with RSSI < -80 stays OUT`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -90)
+        val result = tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+        assertNull(result)
+    }
+
+    @Test
+    fun `stays IN_RANGE while packets with good RSSI arrive`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        tracker.checkAndAnnounce(listOf(beacon))
+        tracker.checkAndAnnounce(listOf(beacon))
+        tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+    }
+
+    @Test
+    fun `weak packet does not change state when IN_RANGE`() {
+        val strong = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        tracker.checkAndAnnounce(listOf(strong))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+
+        // Weak packet - should not exit immediately
+        val weak = createBeacon("AA:BB:CC:DD:EE:FF", -90)
+        tracker.checkAndAnnounce(listOf(weak))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+    }
+
+    @Test
+    fun `returns null when disabled`() {
+        tracker.setEnabled(false)
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val result = tracker.checkAndAnnounce(listOf(beacon))
+        assertNull(result)
+    }
+
+    @Test
+    fun `ignores GENERIC_BLE devices`() {
+        val genericBeacon = BeaconDevice(
+            address = "AA:BB:CC:DD:EE:FF",
+            protocol = BeaconProtocol.GENERIC_BLE,
+            rssi = -50
+        )
+        val result = tracker.checkAndAnnounce(listOf(genericBeacon))
+        assertNull(result)
+        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+    }
+
+    @Test
+    fun `reset clears all state`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+
+        tracker.reset()
+        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+    }
+
+    @Test
+    fun `last in range packet time is updated only for strong packets`() {
+        val strong = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val before = System.currentTimeMillis()
+        tracker.checkAndAnnounce(listOf(strong))
+        val after = System.currentTimeMillis()
+
+        assertTrue(tracker.getLastInRangePacketTime() in before..after)
+
+        // Weak packet should NOT update time
+        val weak = createBeacon("AA:BB:CC:DD:EE:FF", -90)
+        val timeBeforeWeak = tracker.getLastInRangePacketTime()
+        tracker.checkAndAnnounce(listOf(weak))
+        assertEquals(timeBeforeWeak, tracker.getLastInRangePacketTime())
+    }
+
+    @Test
+    fun `boundary RSSI at -80 is accepted`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -80)
+        val result = tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
+        assertNotNull(result)
+    }
+
+    @Test
+    fun `boundary RSSI at -81 is rejected`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -81)
+        val result = tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+        assertNull(result)
+    }
 }

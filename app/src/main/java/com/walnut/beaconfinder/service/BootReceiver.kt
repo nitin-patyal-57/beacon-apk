@@ -12,7 +12,9 @@ class BootReceiver : BroadcastReceiver() {
             Log.d(TAG, "Boot completed, checking background monitoring")
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             if (prefs.getBoolean(KEY_MONITORING_ENABLED, false)) {
+                ScanWatchdogReceiver.schedule(context)
                 BackgroundScanService.start(context)
+                Log.d(TAG, "Background scan service started after boot")
             }
         }
     }

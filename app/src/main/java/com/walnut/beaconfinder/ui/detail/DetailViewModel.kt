@@ -31,8 +31,10 @@ class DetailViewModel @Inject constructor(
 
     private val address: String = savedStateHandle["address"] ?: ""
 
-    private val _device = MutableStateFlow<BeaconDevice?>(null)
-    val device: StateFlow<BeaconDevice?> = _device.asStateFlow()
+    private val _device = MutableStateFlow(DeviceWrapper(null))
+    val device: StateFlow<BeaconDevice?> = _device.map { it.device }.stateIn(
+        viewModelScope, SharingStarted.WhileSubscribed(5000), null
+    )
 
     private val _knownBeacon = MutableStateFlow<KnownBeaconEntity?>(null)
     val knownBeacon: StateFlow<KnownBeaconEntity?> = _knownBeacon.asStateFlow()
@@ -52,23 +54,47 @@ class DetailViewModel @Inject constructor(
     val rssiProcessor = RssiProcessor()
     val packetHistory = PacketHistoryStore()
 
+    private val _refreshTick = MutableStateFlow(0L)
+
     init {
         viewModelScope.launch {
-            // Load device from scanner
             val dev = scannerManager.getDevice(address)
-            _device.value = dev
-
-            // Load known beacon config
+            _device.value = DeviceWrapper(dev)
             _knownBeacon.value = knownBeaconRepo.getByIdentityKey(dev?.identityKey ?: "")
+        }
+
+        viewModelScope.launch {
+            scannerManager.devices.collect { deviceMap ->
+                val updated = deviceMap[address]
+                if (updated != null) {
+                    _device.value = DeviceWrapper(updated)
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            _refreshTick.collect {
+                val dev = scannerManager.getDevice(address)
+                if (dev != null) {
+                    _device.value = DeviceWrapper(dev)
+                }
+            }
+        }
+
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(500L)
+                _refreshTick.value++
+            }
         }
     }
 
     fun refreshDevice() {
-        _device.value = scannerManager.getDevice(address)
+        _device.value = DeviceWrapper(scannerManager.getDevice(address))
     }
 
     fun connect() {
-        val dev = _device.value ?: return
+        val dev = _device.value.device ?: return
         val btDevice = dev.bluetoothDevice ?: return
         connectionManager.connectGatt(btDevice)
     }
@@ -91,16 +117,18 @@ class DetailViewModel @Inject constructor(
 
     fun addRssiSample(rssi: Int) {
         rssiProcessor.addSample(rssi)
-        val dev = _device.value
+        val dev = _device.value.device
         if (dev != null) {
             packetHistory.addEntry(rssi, dev.rawAdvertisement)
         }
     }
 
     fun getDistance(): String? {
-        val dev = _device.value ?: return null
+        val dev = _device.value.device ?: return null
         val txPower = dev.txPower ?: return null
         val distance = DistanceCalculator.estimateDistance(dev.rssi, txPower)
         return DistanceCalculator.formatDistance(distance)
     }
 }
+
+class DeviceWrapper(val device: BeaconDevice?)

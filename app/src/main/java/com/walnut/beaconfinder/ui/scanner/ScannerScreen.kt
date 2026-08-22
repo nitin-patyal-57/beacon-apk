@@ -292,25 +292,11 @@ fun ScannerScreen(
                 singleLine = true
             )
 
-            LazyRow(
-                modifier = Modifier.padding(vertical = 4.dp),
-                contentPadding = PaddingValues(horizontal = 8.dp)
-            ) {
-                items(BeaconProtocolFilter.entries) { filter ->
-                    FilterChip(
-                        selected = selectedFilter == filter,
-                        onClick = { viewModel.setFilter(filter) },
-                        label = { Text(filter.label) },
-                        modifier = Modifier.padding(end = 4.dp)
-                    )
-                }
-            }
-
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 80.dp)
             ) {
-                items(devices, key = { "${it.address}_${it.protocol}" }) { device ->
+                items(devices, key = { it.address }) { device ->
                     DeviceCard(
                         device = device,
                         onClick = { onDeviceClick(device.address) }
@@ -441,21 +427,7 @@ fun DeviceCard(device: BeaconDevice, onClick: () -> Unit) {
                         fontSize = 12.sp
                     )
                 }
-                BeaconProtocol.CUSTOM_BLE -> {
-                    Text(
-                        text = "Custom: ${device.customFormatName ?: "Unknown"}  MfgID: ${String.format("0x%04X", device.manufacturerId ?: 0)}",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
-                BeaconProtocol.GENERIC_BLE -> {
-                    if (device.serviceUuids.isNotEmpty()) {
-                        Text(
-                            text = "Services: ${device.serviceUuids.size}",
-                            fontSize = 12.sp
-                        )
-                    }
-                }
+                BeaconProtocol.CUSTOM_BLE, BeaconProtocol.GENERIC_BLE -> {}
                 else -> {}
             }
 
@@ -470,10 +442,10 @@ fun DeviceCard(device: BeaconDevice, onClick: () -> Unit) {
                         modifier = Modifier
                             .size(8.dp)
                             .clip(CircleShape)
-                            .background(Color.Green)
+                            .background(Color(0xFF4CAF50))
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Nearby", fontSize = 11.sp)
+                    Text("In Range", fontSize = 11.sp, color = Color(0xFF4CAF50), fontWeight = FontWeight.Bold)
                 }
 
                 if (device.connectionState != ConnectionState.DISCONNECTED) {

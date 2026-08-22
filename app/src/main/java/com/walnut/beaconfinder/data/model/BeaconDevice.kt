@@ -34,7 +34,8 @@ data class BeaconDevice(
     val isCustomFormat: Boolean = false,
     val customFormatName: String? = null,
     val advertiseFlags: Int? = null,
-    val txPowerLevel: Int? = null
+    val txPowerLevel: Int? = null,
+    val isInRange: Boolean = false
 ) {
     val displayName: String
         get() = name ?: address
@@ -60,10 +61,18 @@ data class BeaconDevice(
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is BeaconDevice) return false
-        return address == other.address && protocol == other.protocol
+        return address == other.address && protocol == other.protocol &&
+                rssi == other.rssi && isInRange == other.isInRange &&
+                lastSeen == other.lastSeen && connectionState == other.connectionState
     }
 
     override fun hashCode(): Int {
-        return 31 * address.hashCode() + protocol.hashCode()
+        var result = address.hashCode()
+        result = 31 * result + protocol.hashCode()
+        result = 31 * result + rssi
+        result = 31 * result + isInRange.hashCode()
+        result = 31 * result + lastSeen.hashCode()
+        result = 31 * result + connectionState.hashCode()
+        return result
     }
 }

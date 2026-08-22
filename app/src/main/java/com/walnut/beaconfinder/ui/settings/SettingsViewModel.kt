@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import com.walnut.beaconfinder.data.repository.SettingsRepository
 import com.walnut.beaconfinder.service.BackgroundScanService
 import com.walnut.beaconfinder.service.BootReceiver
+import com.walnut.beaconfinder.service.ScanWatchdogReceiver
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.StateFlow
 import javax.inject.Inject
@@ -25,14 +26,16 @@ class SettingsViewModel @Inject constructor(
 
     fun setMonitoringEnabled(enabled: Boolean) {
         settingsRepo.setMonitoringEnabled(enabled)
-        // Save to prefs for boot receiver
-        getApplication<Application>().getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
+        val app = getApplication<Application>()
+        app.getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putBoolean(BootReceiver.KEY_MONITORING_ENABLED, enabled).apply()
 
         if (enabled) {
-            BackgroundScanService.start(getApplication())
+            ScanWatchdogReceiver.schedule(app)
+            BackgroundScanService.start(app)
         } else {
-            BackgroundScanService.stop(getApplication())
+            ScanWatchdogReceiver.cancel(app)
+            BackgroundScanService.stop(app)
         }
     }
 

@@ -31,9 +31,6 @@ class TtsManager @Inject constructor(
         if (isInitialized) {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "beacon_announcement")
             Log.d(TAG, "Speaking: $text")
-        } else {
-            Log.w(TAG, "TTS not initialized, queuing: $text")
-            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "beacon_announcement")
         }
     }
 

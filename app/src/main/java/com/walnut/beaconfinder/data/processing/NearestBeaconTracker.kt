@@ -11,7 +11,6 @@ import com.walnut.beaconfinder.MainActivity
 import com.walnut.beaconfinder.data.model.BeaconDevice
 import com.walnut.beaconfinder.data.model.BeaconProtocol
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -20,140 +19,223 @@ class NearestBeaconTracker @Inject constructor(
     @ApplicationContext private val context: Context,
     private val ttsManager: TtsManager
 ) {
-    private val rssiHistory = ConcurrentHashMap<String, MutableList<RssiSample>>()
-    private val lastAnnounced = ConcurrentHashMap<String, Long>()
+
+    enum class RangeState { UNKNOWN, IN_RANGE, TEMPORARILY_LOST, OUT_OF_RANGE }
+
     private var enabled = false
     private var onNearestBeaconFound: ((BeaconDevice) -> Unit)? = null
-    private var currentNearestAddress: String? = null
-    private var startedAt: Long = 0L
+    private var onOutOfRangeConfirmed: ((String) -> Unit)? = null
 
-    data class RssiSample(val rssi: Int, val timestamp: Long)
+    private var trackedAddress: String? = null
+    private var lastSpoken: String? = null
+    private var trackedDevice: BeaconDevice? = null
+    private var lastSpokenAt: Long = 0L
+
+    private var rangeState = RangeState.UNKNOWN
+    private var confirmedLostAt: Long = 0L
+
+    private var inRangeCount = 0
+    private var outOfRangeCount = 0
+
+    fun reset() {
+        trackedAddress = null
+        lastSpoken = null
+        trackedDevice = null
+        lastSpokenAt = 0L
+        rangeState = RangeState.UNKNOWN
+        confirmedLostAt = 0L
+        inRangeCount = 0
+        outOfRangeCount = 0
+    }
 
     fun setEnabled(enabled: Boolean) {
         this.enabled = enabled
-        if (enabled) {
-            startedAt = System.currentTimeMillis()
-            currentNearestAddress = null
-        } else {
-            currentNearestAddress = null
-        }
+        if (!enabled) reset()
     }
 
     fun setOnNearestBeaconFoundListener(listener: (BeaconDevice) -> Unit) {
         onNearestBeaconFound = listener
     }
 
-    fun processDevice(device: BeaconDevice) {
-        if (!enabled) return
-
-        val history = rssiHistory.getOrPut(device.address) { mutableListOf() }
-        synchronized(history) {
-            history.add(RssiSample(device.rssi, System.currentTimeMillis()))
-            val cutoff = System.currentTimeMillis() - HISTORY_WINDOW_MS
-            history.removeAll { it.timestamp < cutoff }
-        }
+    fun setOnOutOfRangeConfirmedListener(listener: (String) -> Unit) {
+        onOutOfRangeConfirmed = listener
     }
 
     fun checkAndAnnounce(devices: List<BeaconDevice>): BeaconDevice? {
         if (!enabled) return null
 
         val now = System.currentTimeMillis()
-        val recentAddresses = devices.filter { (now - it.lastSeen) < STALE_THRESHOLD_MS }.map { it.address }.toSet()
 
-        rssiHistory.keys.filter { it !in recentAddresses }.forEach { staleAddr ->
-            rssiHistory.remove(staleAddr)
-            lastAnnounced.remove(staleAddr)
-        }
+        val nearest = devices
+            .filter { it.protocol == BeaconProtocol.IBEACON ||
+                it.protocol == BeaconProtocol.EDDYSTONE_UID ||
+                it.protocol == BeaconProtocol.EDDYSTONE_URL ||
+                it.protocol == BeaconProtocol.EDDYSTONE_TLM ||
+                it.protocol == BeaconProtocol.EDDYSTONE_EID }
+            .maxByOrNull { it.rssi }
 
-        val recentBeacons = devices.filter {
-            (now - it.lastSeen) < STALE_THRESHOLD_MS &&
-            it.protocol != BeaconProtocol.GENERIC_BLE
-        }
-        if (recentBeacons.isEmpty()) {
-            val warmupDone = (now - startedAt) > WARMUP_MS
-            if (currentNearestAddress != null && warmupDone) {
-                Log.d(TAG, "No recent beacons, stopping announcement")
-                currentNearestAddress = null
-                ttsManager.speak("Beacon out of range")
-            }
+        if (nearest == null) {
+            handleNoBeacon(now)
             return null
         }
 
-        val nearest = recentBeacons.maxByOrNull { device ->
-            val history = rssiHistory[device.address]
-            val avgRssi = if (history != null && history.isNotEmpty()) {
-                synchronized(history) { history.map { it.rssi }.average() }
-            } else {
-                device.rssi.toDouble()
+        val rssi = nearest.rssi
+        if (Log.isLoggable(TAG, Log.DEBUG)) Log.d(TAG, "RSSI=$rssi state=$rangeState inCount=$inRangeCount outCount=$outOfRangeCount")
+
+        when {
+            rssi >= IN_RANGE_RSSI -> {
+                outOfRangeCount = 0
+                inRangeCount++
+                if (inRangeCount >= CONFIRMATION_COUNT) {
+                    handleConfirmedInRange(nearest, now)
+                }
             }
-            avgRssi
-        } ?: return null
-
-        val avgRssi = synchronized(rssiHistory[nearest.address] ?: ArrayList<RssiSample>()) {
-            (rssiHistory[nearest.address]?.map { it.rssi }?.average() ?: nearest.rssi.toDouble())
-        }
-
-        Log.d(TAG, "Nearest iBeacon: ${nearest.displayName} avgRSSI=${avgRssi.toInt()} current=${nearest.rssi} connectable=${nearest.connectable}")
-
-        if (avgRssi > PROXIMITY_THRESHOLD) {
-            val now = System.currentTimeMillis()
-            val lastTime = lastAnnounced[nearest.address]
-
-            if (nearest.address != currentNearestAddress || (lastTime != null && (now - lastTime) > REANNOUNCE_INTERVAL_MS)) {
-                currentNearestAddress = nearest.address
-                lastAnnounced[nearest.address] = now
-                announceBeacon(nearest, avgRssi.toInt())
+            rssi <= OUT_OF_RANGE_RSSI -> {
+                inRangeCount = 0
+                outOfRangeCount++
+                if (outOfRangeCount >= CONFIRMATION_COUNT) {
+                    handleConfirmedOutOfRange(now)
+                }
             }
-        } else {
-            if (currentNearestAddress != null) {
-                Log.d(TAG, "Nearest beacon signal too weak (${avgRssi.toInt()} dBm), going silent")
-                currentNearestAddress = null
+            else -> {
+                inRangeCount = 0
+                outOfRangeCount = 0
+                handleSilentZone(now)
             }
         }
 
-        onNearestBeaconFound?.invoke(nearest)
-        return nearest
+        return if (rangeState == RangeState.IN_RANGE) nearest else null
     }
 
-    private fun announceBeacon(device: BeaconDevice, avgRssi: Int) {
-        val beaconName = device.name ?: when (device.protocol) {
-            BeaconProtocol.IBEACON -> "iBeacon ${device.iBeaconUuid?.take(8)}"
-            BeaconProtocol.EDDYSTONE_UID -> "Eddystone ${device.eddystoneNamespace?.take(10)}"
-            BeaconProtocol.EDDYSTONE_URL -> "Eddystone ${device.eddystoneUrl}"
-            else -> device.address
+    private fun handleConfirmedInRange(device: BeaconDevice, now: Long) {
+        when (rangeState) {
+            RangeState.UNKNOWN, RangeState.OUT_OF_RANGE -> {
+                rangeState = RangeState.IN_RANGE
+                trackedAddress = device.address
+                trackedDevice = device
+                if (canSpeak() && lastSpoken != "in range") {
+                    lastSpoken = "in range"
+                    lastSpokenAt = now
+                    Log.d(TAG, "Announcing in range: ${device.displayName} RSSI=${device.rssi}")
+                    announceBeacon(device, "in range")
+                }
+                onNearestBeaconFound?.invoke(device)
+            }
+            RangeState.TEMPORARILY_LOST -> {
+                rangeState = RangeState.IN_RANGE
+                confirmedLostAt = 0L
+                trackedAddress = device.address
+                trackedDevice = device
+                Log.d(TAG, "Beacon returned, back to IN_RANGE")
+                onNearestBeaconFound?.invoke(device)
+            }
+            RangeState.IN_RANGE -> {
+                trackedAddress = device.address
+                trackedDevice = device
+                onNearestBeaconFound?.invoke(device)
+            }
         }
-        val distance = estimateDistance(avgRssi)
+    }
 
-        val proximity = when {
-            distance < 1.0 -> "very close"
-            distance < 3.0 -> "nearby"
-            distance < 10.0 -> "in range"
-            else -> "far"
+    private fun handleConfirmedOutOfRange(now: Long) {
+        when (rangeState) {
+            RangeState.IN_RANGE -> {
+                rangeState = RangeState.TEMPORARILY_LOST
+                confirmedLostAt = now
+                Log.d(TAG, "RSSI confirmed low, entering TEMPORARILY_LOST")
+            }
+            RangeState.TEMPORARILY_LOST -> {
+                if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
+                    rangeState = RangeState.OUT_OF_RANGE
+                    confirmedLostAt = 0L
+                    inRangeCount = 0
+                    outOfRangeCount = 0
+                    if (canSpeak() && lastSpoken != "out of range") {
+                        lastSpoken = "out of range"
+                        lastSpokenAt = now
+                        Log.d(TAG, "Confirmed out of range")
+                        ttsManager.speak("Beacon out of range")
+                        trackedAddress?.let { onOutOfRangeConfirmed?.invoke(it) }
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun handleSilentZone(now: Long) {
+        when (rangeState) {
+            RangeState.IN_RANGE -> {
+                rangeState = RangeState.TEMPORARILY_LOST
+                confirmedLostAt = now
+                Log.d(TAG, "RSSI in silent zone, entering TEMPORARILY_LOST")
+            }
+            RangeState.TEMPORARILY_LOST -> {
+                if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
+                    rangeState = RangeState.OUT_OF_RANGE
+                    confirmedLostAt = 0L
+                    inRangeCount = 0
+                    outOfRangeCount = 0
+                    if (canSpeak() && lastSpoken != "out of range") {
+                        lastSpoken = "out of range"
+                        lastSpokenAt = now
+                        Log.d(TAG, "Confirmed out of range from silent zone")
+                        ttsManager.speak("Beacon out of range")
+                        trackedAddress?.let { onOutOfRangeConfirmed?.invoke(it) }
+                    }
+                }
+            }
+            else -> {}
+        }
+    }
+
+    private fun handleNoBeacon(now: Long) {
+        inRangeCount = 0
+        outOfRangeCount = 0
+        when (rangeState) {
+            RangeState.TEMPORARILY_LOST -> {
+                if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
+                    rangeState = RangeState.OUT_OF_RANGE
+                    confirmedLostAt = 0L
+                    if (canSpeak() && lastSpoken != "out of range") {
+                        lastSpoken = "out of range"
+                        lastSpokenAt = now
+                        Log.d(TAG, "No beacon seen, confirmed out of range")
+                        ttsManager.speak("Beacon out of range")
+                        trackedAddress?.let { onOutOfRangeConfirmed?.invoke(it) }
+                    }
+                }
+            }
+            RangeState.IN_RANGE -> {
+                rangeState = RangeState.TEMPORARILY_LOST
+                confirmedLostAt = now
+                Log.d(TAG, "Beacon disappeared, entering TEMPORARILY_LOST")
+            }
+            else -> {}
+        }
+    }
+
+    private fun canSpeak(): Boolean {
+        return (System.currentTimeMillis() - lastSpokenAt) >= COOLDOWN_MS
+    }
+
+    fun getRangeState(): RangeState = rangeState
+
+    private fun announceBeacon(device: BeaconDevice, proximity: String) {
+        val beaconName = device.name?.takeIf { it.isNotBlank() } ?: when (device.protocol) {
+            BeaconProtocol.IBEACON -> "Unknown iBeacon"
+            BeaconProtocol.EDDYSTONE_UID -> "Unknown Eddystone"
+            BeaconProtocol.EDDYSTONE_URL -> "Unknown Eddystone"
+            else -> "Unknown beacon"
         }
 
-        val protocolName = when (device.protocol) {
-            BeaconProtocol.IBEACON -> "iBeacon"
-            BeaconProtocol.EDDYSTONE_UID -> "Eddystone UID"
-            BeaconProtocol.EDDYSTONE_URL -> "Eddystone URL"
-            BeaconProtocol.EDDYSTONE_TLM -> "Eddystone TLM"
-            BeaconProtocol.EDDYSTONE_EID -> "Eddystone EID"
-            BeaconProtocol.CUSTOM_BLE -> "Custom BLE"
-            else -> "BLE device"
-        }
-
-        val ttsMessage = "$protocolName $beaconName detected, $proximity"
-        Log.d(TAG, "Announcing: $ttsMessage")
+        val ttsMessage = "$beaconName, $proximity"
+        Log.d(TAG, "TTS: $ttsMessage (RSSI=${device.rssi})")
         ttsManager.speak(ttsMessage)
-        sendProximityNotification(device, beaconName, protocolName, avgRssi, proximity)
+        sendProximityNotification(device, beaconName, device.rssi, proximity)
     }
 
-    private fun estimateDistance(rssi: Int): Double {
-        val txPower = -59
-        val ratio = (txPower - rssi).toDouble() / (10 * 2.0)
-        return if (ratio < 1.0) Math.pow(10.0, ratio) else Math.pow(10.0, ratio) * 0.89976
-    }
-
-    private fun sendProximityNotification(device: BeaconDevice, beaconName: String, protocolName: String, rssi: Int, proximity: String) {
+    private fun sendProximityNotification(device: BeaconDevice, beaconName: String, rssi: Int, proximity: String) {
         val intent = Intent(context, MainActivity::class.java).apply {
             putExtra("DEVICE_ADDRESS", device.address)
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -163,16 +245,9 @@ class NearestBeaconTracker @Inject constructor(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val details = when (device.protocol) {
-            BeaconProtocol.IBEACON -> "UUID: ${device.iBeaconUuid?.take(8)}... M:${device.iBeaconMajor} m:${device.iBeaconMinor}"
-            BeaconProtocol.EDDYSTONE_UID -> "NS: ${device.eddystoneNamespace?.take(10)}... Inst: ${device.eddystoneInstance}"
-            BeaconProtocol.EDDYSTONE_URL -> "URL: ${device.eddystoneUrl}"
-            else -> device.displayName
-        }
-
         val notification = Notification.Builder(context, BeaconFinderApp.CHANNEL_NEARBY)
-            .setContentTitle("$protocolName $proximity: $beaconName")
-            .setContentText("$details ($rssi dBm)")
+            .setContentTitle("$beaconName - $proximity")
+            .setContentText("Signal: $rssi dBm")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
@@ -184,11 +259,11 @@ class NearestBeaconTracker @Inject constructor(
 
     companion object {
         private const val TAG = "NearestBeaconTracker"
-        private const val PROXIMITY_THRESHOLD = -90
-        private const val REANNOUNCE_INTERVAL_MS = 10_000L
-        private const val HISTORY_WINDOW_MS = 10_000L
-        private const val STALE_THRESHOLD_MS = 8_000L
-        private const val WARMUP_MS = 5_000L
+        private const val COOLDOWN_MS = 5_000L
         private const val NOTIFICATION_ID_PROXIMITY = 3000
+        const val IN_RANGE_RSSI = -60
+        const val OUT_OF_RANGE_RSSI = -90
+        const val OUT_OF_RANGE_TIMEOUT_MS = 10_000L
+        const val CONFIRMATION_COUNT = 2
     }
 }

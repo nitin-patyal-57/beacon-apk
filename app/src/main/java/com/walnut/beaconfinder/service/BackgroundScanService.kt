@@ -4,22 +4,35 @@ import android.Manifest
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
-import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.net.Uri
+import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
+import android.os.ParcelUuid
+import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.walnut.beaconfinder.BeaconFinderApp
+import com.walnut.beaconfinder.ErrorLogManager
 import com.walnut.beaconfinder.MainActivity
-import com.walnut.beaconfinder.R
 import com.walnut.beaconfinder.data.db.BeaconDatabase
 import com.walnut.beaconfinder.data.db.KnownBeaconEntity
+import com.walnut.beaconfinder.data.model.BeaconDevice
 import com.walnut.beaconfinder.data.model.BeaconProtocol
 import com.walnut.beaconfinder.data.model.PresenceState
 import com.walnut.beaconfinder.data.parser.BeaconParserEngine
@@ -27,12 +40,13 @@ import com.walnut.beaconfinder.data.parser.CustomBeaconParser
 import com.walnut.beaconfinder.data.processing.BeaconPresenceTracker
 import com.walnut.beaconfinder.data.processing.CooldownTracker
 import kotlinx.coroutines.*
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 class BackgroundScanService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-    private var scanner: BluetoothLeScanner? = null
+    private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private var scanCallback: ScanCallback? = null
     private val parserEngine = BeaconParserEngine(
         com.walnut.beaconfinder.data.parser.IBeaconParser(),
@@ -44,8 +58,28 @@ class BackgroundScanService : Service() {
     private val cooldownTracker = CooldownTracker()
     private var knownBeacons = listOf<KnownBeaconEntity>()
 
-    private val discoveredBeacons = ConcurrentHashMap<String, Long>()
-    private val BEACON_DISCOVERY_COOLDOWN_MS = 15_000L
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var lastScanResultTime: Long = 0L
+    private var healthCheckJob: Job? = null
+    private var bgScanRetryCount = 0
+    private var lastScanStartTime: Long = 0L
+
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var lastTtsSpoken: String? = null
+    private var lastTtsAt: Long = 0L
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
+
+    private var btStateReceiver: BroadcastReceiver? = null
+
+    private enum class RangeState { UNKNOWN, IN_RANGE, TEMPORARILY_LOST, OUT_OF_RANGE }
+    private var rangeState = RangeState.UNKNOWN
+    private var confirmedLostAt: Long = 0L
+    private var inRangeCount = 0
+    private var outOfRangeCount = 0
+    private var trackedAddress: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -59,9 +93,68 @@ class BackgroundScanService : Service() {
             stopSelf()
             return
         }
+        acquireWakeLock()
+        initTts()
+        setServiceAlive(true)
+        ScanWatchdogReceiver.schedule(this)
+        startHeartbeat()
+        registerBtStateReceiver()
         scope.launch {
             loadKnownBeacons()
             loadCustomFormats()
+        }
+    }
+
+    private fun registerBtStateReceiver() {
+        btStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == BluetoothAdapter.ACTION_STATE_CHANGED) {
+                    val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF)
+                    when (state) {
+                        BluetoothAdapter.STATE_ON -> {
+                            Log.d(TAG, "BT turned ON internally → restarting scan")
+                            scope.launch {
+                                delay(1000)
+                                startBackgroundScan()
+                            }
+                        }
+                        BluetoothAdapter.STATE_OFF -> {
+                            Log.d(TAG, "BT turned OFF internally → stopping scan")
+                            stopBackgroundScan()
+                            updateNotification("Waiting for Bluetooth...")
+                        }
+                    }
+                }
+            }
+        }
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        registerReceiver(btStateReceiver, filter)
+        Log.d(TAG, "BT state receiver registered")
+    }
+
+    private fun initTts() {
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        tts = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale.getDefault()
+                try {
+                    val attrs = AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                    tts?.setAudioAttributes(attrs)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to set TTS audio attributes", e)
+                }
+                ttsReady = true
+                Log.d(TAG, "TTS initialized")
+            } else {
+                Log.w(TAG, "TTS init failed: $status, retrying in 5s")
+                scope.launch {
+                    delay(5000)
+                    initTts()
+                }
+            }
         }
     }
 
@@ -69,14 +162,61 @@ class BackgroundScanService : Service() {
         when (intent?.action) {
             ACTION_START -> startBackgroundScan()
             ACTION_STOP -> stopBackgroundScan()
+            null -> {
+                Log.d(TAG, "Service recreated by system (START_STICKY), restarting scan")
+                startBackgroundScan()
+            }
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         stopBackgroundScan()
+        unregisterBtStateReceiver()
+        releaseWakeLock()
+        try {
+            audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+        } catch (_: Exception) {}
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        ttsReady = false
+        setServiceAlive(false)
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun unregisterBtStateReceiver() {
+        try {
+            btStateReceiver?.let { unregisterReceiver(it) }
+            btStateReceiver = null
+            Log.d(TAG, "BT state receiver unregistered")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unregister BT state receiver", e)
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d(TAG, "Task removed, service continues running as foreground service")
+    }
+
+    private fun setServiceAlive(alive: Boolean) {
+        getSharedPreferences(BootReceiver.PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putBoolean(ScanWatchdogReceiver.KEY_SERVICE_ALIVE, alive)
+            .putLong(ScanWatchdogReceiver.KEY_LAST_ALIVE_TIME, System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun startHeartbeat() {
+        scope.launch {
+            while (isActive) {
+                delay(30_000L)
+                setServiceAlive(true)
+                updateNotification("Monitoring iBeacon & Eddystone")
+            }
+        }
     }
 
     private fun loadKnownBeacons() {
@@ -102,48 +242,228 @@ class BackgroundScanService : Service() {
         }
     }
 
-    private fun startBackgroundScan() {
-        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        scanner = bluetoothManager?.adapter?.bluetoothLeScanner ?: run {
-            Log.e(TAG, "BLE scanner unavailable")
-            stopSelf()
+    private fun buildScanFilters(): List<ScanFilter> {
+        val filters = mutableListOf<ScanFilter>()
+
+        val iBeaconFilter = ScanFilter.Builder()
+            .setManufacturerData(0x004C, byteArrayOf())
+            .build()
+        filters.add(iBeaconFilter)
+
+        val eddystoneFilter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid.fromString(EDDYSTONE_SERVICE_UUID))
+            .build()
+        filters.add(eddystoneFilter)
+
+        return filters
+    }
+
+    private fun startBackgroundScan(forceRestart: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!forceRestart && now - lastScanStartTime < MIN_SCAN_START_INTERVAL_MS) {
+            Log.d(TAG, "Scan start throttled (last start was ${(now - lastScanStartTime) / 1000}s ago)")
+            return
+        }
+        if (!forceRestart && scanCallback != null && scanner != null) {
+            Log.d(TAG, "Scan already active, skipping restart")
             return
         }
 
+        if (!hasRequiredPermissions()) {
+            Log.w(TAG, "Missing required permissions")
+            ErrorLogManager.logWarning(TAG, "Missing required permissions, scan cannot start")
+            updateNotification("Missing permissions. Grant all required permissions.")
+            return
+        }
+
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = bluetoothManager?.adapter
+
+        if (adapter == null || !adapter.isEnabled) {
+            Log.w(TAG, "Bluetooth not available")
+            ErrorLogManager.logWarning(TAG, "Bluetooth not available or disabled")
+            updateNotification("Waiting for Bluetooth...")
+            return
+        }
+
+        stopBleScan()
+
+        try {
+            scanner = adapter.bluetoothLeScanner
+        } catch (e: SecurityException) {
+            Log.e(TAG, "SecurityException getting scanner", e)
+            ErrorLogManager.logError(TAG, "SecurityException getting BLE scanner", e)
+            updateNotification("Bluetooth permission denied.")
+            return
+        }
+
+        if (scanner == null) {
+            Log.w(TAG, "BLE scanner null")
+            ErrorLogManager.logWarning(TAG, "BLE scanner returned null - BT may be toggling")
+            updateNotification("BLE scanner unavailable.")
+            return
+        }
+
+        val filters = buildScanFilters()
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setReportDelay(0)
             .build()
 
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
-                processResult(result)
+                try {
+                    processResult(result)
+                } catch (e: SecurityException) {
+                    Log.e(TAG, "SecurityException in scan callback", e)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in scan callback", e)
+                }
+            }
+
+            override fun onBatchScanResults(results: MutableList<ScanResult>) {
+                for (result in results) {
+                    try {
+                        processResult(result)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in batch callback", e)
+                    }
+                }
             }
 
             override fun onScanFailed(errorCode: Int) {
-                Log.e(TAG, "Background scan failed: $errorCode")
-                updateNotification("Scan failed. Restarting...")
-                scope.launch {
-                    delay(5000)
-                    startBackgroundScan()
+                Log.e(TAG, "Scan failed: $errorCode")
+                ErrorLogManager.logError(TAG, "BLE scan failed with code $errorCode (attempt ${bgScanRetryCount + 1}/5)")
+                scanCallback = null
+                scanner = null
+                bgScanRetryCount++
+                if (bgScanRetryCount <= 5) {
+                    val backoffMs = 3000L * bgScanRetryCount
+                    updateNotification("Scan failed (code $errorCode), retry ${bgScanRetryCount}/5 in ${backoffMs / 1000}s...")
+                    Log.w(TAG, "Retrying scan in ${backoffMs}ms (attempt $bgScanRetryCount)")
+                    scope.launch {
+                        delay(backoffMs)
+                        startBackgroundScan(forceRestart = true)
+                    }
+                } else {
+                    Log.e(TAG, "Scan failed after 5 retries, waiting 60s")
+                    updateNotification("Scan failed. Retrying in 60s...")
+                    bgScanRetryCount = 0
+                    scope.launch {
+                        delay(60_000L)
+                        startBackgroundScan(forceRestart = true)
+                    }
                 }
             }
         }
 
         try {
-            scanner?.startScan(null, settings, scanCallback)
-            updateNotification("Monitoring ${knownBeacons.size} known beacons")
-            Log.d(TAG, "Background scan started")
+            val cb = scanCallback ?: return
+            scanner?.startScan(filters, settings, cb)
+            lastScanStartTime = System.currentTimeMillis()
+            bgScanRetryCount = 0
+            lastScanResultTime = System.currentTimeMillis()
+            startHealthCheck()
+            updateNotification("Monitoring iBeacon & Eddystone")
+            Log.d(TAG, "Background scan started with ${filters.size} filters")
         } catch (e: SecurityException) {
-            Log.e(TAG, "Permission denied for background scan", e)
-            stopSelf()
+            Log.e(TAG, "Permission denied starting scan", e)
+            ErrorLogManager.logError(TAG, "Permission denied starting BLE scan", e)
+            scanner = null
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception starting scan", e)
+            ErrorLogManager.logError(TAG, "Exception starting BLE scan: ${e.message}", e)
+            scanner = null
         }
     }
 
-    private fun processResult(result: ScanResult) {
-        val beacon = parserEngine.parse(result)
+    private fun startHealthCheck() {
+        healthCheckJob?.cancel()
+        healthCheckJob = scope.launch {
+            while (isActive) {
+                delay(HEALTH_CHECK_INTERVAL_MS)
+                val elapsed = System.currentTimeMillis() - lastScanResultTime
+                if (lastScanResultTime > 0 && elapsed > HEALTH_CHECK_TIMEOUT_MS) {
+                    Log.w(TAG, "No scan results for ${elapsed / 1000}s, restarting scan")
+                    updateNotification("Scan stalled, restarting...")
+                    stopBleScan()
+                    delay(1000)
+                    scanner = null
+                    startBackgroundScan(forceRestart = true)
+                }
+            }
+        }
+    }
 
-        // Check if this matches any known beacon
+    private fun hasRequiredPermissions(): Boolean {
+        if (Build.VERSION.SDK_INT >= 31) {
+            val hasBtScan = checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+            val hasBtConnect = checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            if (!hasBtScan || !hasBtConnect) {
+                return false
+            }
+        }
+        val hasFineLocation = checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        val hasCoarseLocation = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        return hasFineLocation || hasCoarseLocation
+    }
+
+    private fun acquireWakeLock() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "BeaconFinder::BackgroundScanWakeLock"
+            )?.apply {
+                acquire()
+                Log.d(TAG, "Wake lock acquired (indefinite)")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire wake lock", e)
+        }
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wifiManager?.createWifiLock(
+                WifiManager.WIFI_MODE_SCAN_ONLY,
+                "BeaconFinder::BackgroundScanWifiLock"
+            )?.apply {
+                acquire()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to acquire wifi lock", e)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+            wakeLock = null
+        } catch (_: Exception) {}
+        try {
+            wifiLock?.let { if (it.isHeld) it.release() }
+            wifiLock = null
+        } catch (_: Exception) {}
+    }
+
+    private fun processResult(result: ScanResult) {
+        lastScanResultTime = System.currentTimeMillis()
+
+        val beacon = try {
+            parserEngine.parse(result)
+        } catch (e: Exception) {
+            Log.e(TAG, "Parser error", e)
+            return
+        }
+
+        if (beacon.protocol != BeaconProtocol.IBEACON &&
+            beacon.protocol != BeaconProtocol.EDDYSTONE_UID &&
+            beacon.protocol != BeaconProtocol.EDDYSTONE_URL &&
+            beacon.protocol != BeaconProtocol.EDDYSTONE_TLM &&
+            beacon.protocol != BeaconProtocol.EDDYSTONE_EID) {
+            return
+        }
+
         val match = knownBeacons.find { entity ->
             when (entity.protocol) {
                 "IBEACON" -> entity.uuid == beacon.iBeaconUuid &&
@@ -157,12 +477,12 @@ class BackgroundScanService : Service() {
         }
 
         if (match != null) {
-            // Known beacon - use presence tracker with configured settings
             val presence = presenceTracker.updatePresence(beacon, match.presenceTimeoutMs, match.minRssi)
-            if (presence != null && match.notificationEnabled) {
+            if (presence != null) {
                 when (presence.presenceState) {
                     PresenceState.NEARBY, PresenceState.RE_ENTERED -> {
-                        if (!presence.notificationSent && cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
+                        speak("${match.name} beacon in range")
+                        if (match.notificationEnabled && !presence.notificationSent && cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
                             sendNearbyNotification(match.name, beacon.displayName)
                             presence.notificationSent = true
                         }
@@ -171,70 +491,167 @@ class BackgroundScanService : Service() {
                 }
             }
         } else {
-            // Any other nearby beacon - notify for all detected BLE devices
-            notifyForDiscoveredBeacon(beacon)
+            handleRangeTracking(beacon)
         }
     }
 
-    private fun notifyForDiscoveredBeacon(beacon: com.walnut.beaconfinder.data.model.BeaconDevice) {
-        // Check cooldown to avoid notification spam
-        val lastSeen = discoveredBeacons[beacon.identityKey]
+    private fun handleRangeTracking(device: BeaconDevice) {
         val now = System.currentTimeMillis()
-        if (lastSeen != null && (now - lastSeen) < BEACON_DISCOVERY_COOLDOWN_MS) {
-            return
-        }
-        discoveredBeacons[beacon.identityKey] = now
+        val rssi = device.rssi
+        trackedAddress = device.address
 
-        val protocolName = when (beacon.protocol) {
-            com.walnut.beaconfinder.data.model.BeaconProtocol.IBEACON -> "iBeacon"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_UID -> "Eddystone UID"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_URL -> "Eddystone URL"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_TLM -> "Eddystone TLM"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_EID -> "Eddystone EID"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.CUSTOM_BLE -> "Custom BLE"
-            com.walnut.beaconfinder.data.model.BeaconProtocol.GENERIC_BLE -> "BLE Device"
-        }
+        val beaconLabel = device.name?.takeIf { it.isNotBlank() }
+            ?: when (device.protocol) {
+                BeaconProtocol.IBEACON -> {
+                    val id = device.iBeaconUuid?.takeLast(8) ?: ""
+                    "iBeacon $id"
+                }
+                BeaconProtocol.EDDYSTONE_UID -> {
+                    val ns = device.eddystoneNamespace?.takeLast(4) ?: ""
+                    "Eddystone $ns"
+                }
+                BeaconProtocol.EDDYSTONE_URL -> device.eddystoneUrl ?: "Eddystone"
+                else -> device.protocol.name.lowercase()
+            }
 
-        val details = when (beacon.protocol) {
-            com.walnut.beaconfinder.data.model.BeaconProtocol.IBEACON -> {
-                "UUID: ${beacon.iBeaconUuid?.take(8)}... Major: ${beacon.iBeaconMajor} Minor: ${beacon.iBeaconMinor}"
+        when {
+            rssi >= IN_RANGE_RSSI -> {
+                outOfRangeCount = 0
+                inRangeCount++
+                if (inRangeCount >= CONFIRMATION_COUNT) {
+                    when (rangeState) {
+                        RangeState.UNKNOWN, RangeState.OUT_OF_RANGE -> {
+                            rangeState = RangeState.IN_RANGE
+                            speak("$beaconLabel in range")
+                            sendRangeNotification(device, "in range")
+                        }
+                        RangeState.TEMPORARILY_LOST -> {
+                            rangeState = RangeState.IN_RANGE
+                            confirmedLostAt = 0L
+                        }
+                        RangeState.IN_RANGE -> {}
+                    }
+                }
             }
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_UID -> {
-                "Namespace: ${beacon.eddystoneNamespace?.take(10)}... Instance: ${beacon.eddystoneInstance}"
-            }
-            com.walnut.beaconfinder.data.model.BeaconProtocol.EDDYSTONE_URL -> {
-                "URL: ${beacon.eddystoneUrl}"
+            rssi <= OUT_OF_RANGE_RSSI -> {
+                inRangeCount = 0
+                outOfRangeCount++
+                if (outOfRangeCount >= CONFIRMATION_COUNT) {
+                    when (rangeState) {
+                        RangeState.IN_RANGE -> {
+                            rangeState = RangeState.TEMPORARILY_LOST
+                            confirmedLostAt = now
+                        }
+                        RangeState.TEMPORARILY_LOST -> {
+                            if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
+                                rangeState = RangeState.OUT_OF_RANGE
+                                speak("$beaconLabel out of range")
+                                sendRangeNotification(device, "out of range")
+                                resetRangeTracking()
+                            }
+                        }
+                        else -> {}
+                    }
+                }
             }
             else -> {
-                val name = beacon.displayName
-                val rssi = beacon.rssi
-                val services = if (beacon.serviceUuids.isNotEmpty()) " ${beacon.serviceUuids.size} services" else ""
-                "$name (${rssi}dBm)$services"
+                inRangeCount = 0
+                outOfRangeCount = 0
+                when (rangeState) {
+                    RangeState.IN_RANGE -> {
+                        rangeState = RangeState.TEMPORARILY_LOST
+                        confirmedLostAt = now
+                    }
+                    RangeState.TEMPORARILY_LOST -> {
+                        if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
+                            rangeState = RangeState.OUT_OF_RANGE
+                            speak("$beaconLabel out of range")
+                            sendRangeNotification(device, "out of range")
+                            resetRangeTracking()
+                        }
+                    }
+                    else -> {}
+                }
             }
         }
-
-        sendDiscoveredNotification(protocolName, details, beacon.address)
     }
 
-    private fun sendDiscoveredNotification(protocolName: String, details: String, address: String) {
-        val intent = Intent(this, MainActivity::class.java).apply {
-            putExtra("DEVICE_ADDRESS", address)
+    private fun resetRangeTracking() {
+        inRangeCount = 0
+        outOfRangeCount = 0
+        confirmedLostAt = 0L
+        trackedAddress = null
+    }
+
+    private fun speak(text: String) {
+        if (!ttsReady) {
+            Log.w(TAG, "TTS not ready, cannot speak: $text")
+            return
         }
+        val now = System.currentTimeMillis()
+        if (text == lastTtsSpoken && (now - lastTtsAt) < TTS_COOLDOWN_MS) return
+        lastTtsSpoken = text
+        lastTtsAt = now
+
+        try {
+            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { }
+                .build()
+            audioFocusRequest = focusRequest
+            audioManager?.requestAudioFocus(focusRequest)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to request audio focus", e)
+        }
+
+        val params = Bundle().apply {
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_ALARM)
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+        }
+        val utteranceId = "bg_${System.currentTimeMillis()}"
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        Log.d(TAG, "TTS speaking: $text")
+
+        scope.launch {
+            delay(4000L)
+            try {
+                audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun sendRangeNotification(device: BeaconDevice, proximity: String) {
+        val protocolName = when (device.protocol) {
+            BeaconProtocol.IBEACON -> "iBeacon"
+            BeaconProtocol.EDDYSTONE_UID -> "Eddystone UID"
+            BeaconProtocol.EDDYSTONE_URL -> "Eddystone URL"
+            BeaconProtocol.EDDYSTONE_TLM -> "Eddystone TLM"
+            BeaconProtocol.EDDYSTONE_EID -> "Eddystone EID"
+            else -> "Beacon"
+        }
+        val details = "$protocolName $proximity (${device.rssi}dBm)"
+
+        val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
-            this, address.hashCode(), intent,
+            this, 0, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
-            .setContentTitle("Nearby: $protocolName")
+            .setContentTitle("BeaconFinder")
             .setContentText(details)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
             .build()
 
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(NOTIFICATION_ID + address.hashCode(), notification)
+        nm.notify(NOTIFICATION_ID_BEACON + (device.address.hashCode() and 0x7FFFFFFF), notification)
     }
 
     private fun sendNearbyNotification(configName: String, beaconName: String) {
@@ -253,10 +670,17 @@ class BackgroundScanService : Service() {
             .build()
 
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(NOTIFICATION_ID + System.currentTimeMillis().toInt(), notification)
+        val id = NOTIFICATION_ID_BEACON + 10000 + (System.nanoTime().toInt() and 0x7FFF)
+        nm.notify(id, notification)
     }
 
     private fun stopBackgroundScan() {
+        healthCheckJob?.cancel()
+        healthCheckJob = null
+        stopBleScan()
+    }
+
+    private fun stopBleScan() {
         try {
             scanCallback?.let { scanner?.stopScan(it) }
         } catch (e: Exception) {
@@ -282,8 +706,12 @@ class BackgroundScanService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(NOTIFICATION_ID, createNotification(text))
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.notify(NOTIFICATION_ID, createNotification(text))
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to update notification", e)
+        }
     }
 
     private fun hexToBytes(hex: String): ByteArray {
@@ -296,22 +724,60 @@ class BackgroundScanService : Service() {
     companion object {
         const val TAG = "BackgroundScanService"
         const val NOTIFICATION_ID = 1001
+        private const val NOTIFICATION_ID_BEACON = 2000
         const val ACTION_START = "com.walnut.beaconfinder.START_BACKGROUND"
         const val ACTION_STOP = "com.walnut.beaconfinder.STOP_BACKGROUND"
+        private const val IN_RANGE_RSSI = -60
+        private const val OUT_OF_RANGE_RSSI = -90
+        private const val OUT_OF_RANGE_TIMEOUT_MS = 5_000L
+        private const val CONFIRMATION_COUNT = 1
+        private const val TTS_COOLDOWN_MS = 3_000L
+        private const val HEALTH_CHECK_INTERVAL_MS = 10_000L
+        private const val HEALTH_CHECK_TIMEOUT_MS = 15_000L
+        private const val EDDYSTONE_SERVICE_UUID = "0000FEAA-0000-1000-8000-00805F9B34FB"
+        private const val MIN_SCAN_START_INTERVAL_MS = 15_000L
 
         fun start(context: Context) {
             if (Build.VERSION.SDK_INT >= 31) {
                 val hasBtConnect = context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
                 val hasBtScan = context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-                if (!hasBtConnect && !hasBtScan) {
-                    Log.w(TAG, "Cannot start BackgroundScanService - Bluetooth permissions not granted")
+                if (!hasBtConnect || !hasBtScan) {
+                    Log.w(TAG, "Cannot start - Bluetooth permissions not granted")
                     return
                 }
             }
-            val intent = Intent(context, BackgroundScanService::class.java).apply {
-                action = ACTION_START
+            val hasFineLocation = context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val hasCoarseLocation = context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            if (!hasFineLocation && !hasCoarseLocation) {
+                Log.w(TAG, "Cannot start - Location permission not granted")
+                return
             }
-            context.startForegroundService(intent)
+            try {
+                val intent = Intent(context, BackgroundScanService::class.java).apply {
+                    action = ACTION_START
+                }
+                context.startForegroundService(intent)
+                Log.d(TAG, "startForegroundService succeeded")
+            } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
+                Log.w(TAG, "Cannot start foreground service from background (Android 12+), retrying in 2s")
+                ErrorLogManager.logWarning(TAG, "ForegroundServiceStartNotAllowed - retrying in 2s")
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    try {
+                        val retryIntent = Intent(context, BackgroundScanService::class.java).apply {
+                            action = ACTION_START
+                        }
+                        context.startForegroundService(retryIntent)
+                        Log.d(TAG, "Retry startForegroundService succeeded")
+                    } catch (e2: Exception) {
+                        Log.e(TAG, "Retry also failed, scheduling watchdog", e2)
+                        ScanWatchdogReceiver.schedule(context)
+                    }
+                }, 2000)
+            } catch (e: SecurityException) {
+                Log.e(TAG, "SecurityException starting foreground service", e)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start foreground service", e)
+            }
         }
 
         fun stop(context: Context) {

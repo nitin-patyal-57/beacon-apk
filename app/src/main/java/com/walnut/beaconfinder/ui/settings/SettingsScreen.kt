@@ -3,11 +3,18 @@ package com.walnut.beaconfinder.ui.settings
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -21,6 +28,9 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.walnut.beaconfinder.BeaconFinderApp
+import com.walnut.beaconfinder.ErrorLogManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -38,6 +48,18 @@ fun SettingsScreen(
     val context = LocalContext.current
     var crashLog by remember { mutableStateOf("") }
     var showCrashDialog by remember { mutableStateOf(false) }
+    var errorLog by remember { mutableStateOf("") }
+    var showErrorDialog by remember { mutableStateOf(false) }
+    var showLogcatDialog by remember { mutableStateOf(false) }
+    var logcatOutput by remember { mutableStateOf("") }
+
+    var isBatteryOptimized by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            isBatteryOptimized = pm?.isIgnoringBatteryOptimizations(context.packageName) != true
+        }
+    }
 
     LaunchedEffect(Unit) {
         try {
@@ -46,6 +68,20 @@ fun SettingsScreen(
                 crashLog = file.readText()
             }
         } catch (_: Exception) {}
+    }
+
+    LaunchedEffect(showErrorDialog) {
+        if (showErrorDialog) {
+            errorLog = ErrorLogManager.getLogFileContent(context)
+        }
+    }
+
+    LaunchedEffect(showLogcatDialog) {
+        if (showLogcatDialog) {
+            logcatOutput = withContext(Dispatchers.IO) {
+                ErrorLogManager.getLogcatErrors(context)
+            }
+        }
     }
 
     Scaffold(
@@ -97,6 +133,121 @@ fun SettingsScreen(
                 }
             }
 
+            SettingsSection("Diagnostics") {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    ),
+                    onClick = { showErrorDialog = true }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.BugReport,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "View Error Log",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "App errors and warnings captured during runtime",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                    ),
+                    onClick = { showLogcatDialog = true }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.BugReport,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "View Logcat Errors",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            Text(
+                                "System logcat errors (last 300 lines)",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    ),
+                    onClick = {
+                        ErrorLogManager.clearLog(context)
+                        val crashFile = File(context.filesDir, BeaconFinderApp.CRASH_LOG_FILE)
+                        if (crashFile.exists()) crashFile.delete()
+                        crashLog = ""
+                        errorLog = ""
+                        Toast.makeText(context, "All logs cleared", Toast.LENGTH_SHORT).show()
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.error
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Clear All Logs",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                            Text(
+                                "Delete crash log and error log",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+            }
+
             // Background Monitoring
             SettingsSection("Background Monitoring") {
                 SettingsSwitch(
@@ -105,6 +256,50 @@ fun SettingsScreen(
                     checked = monitoringEnabled,
                     onCheckedChange = { viewModel.setMonitoringEnabled(it) }
                 )
+            }
+
+            // Battery Optimization Warning
+            if (isBatteryOptimized && monitoringEnabled) {
+                SettingsSection("Battery Optimization") {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(4.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        ),
+                        onClick = {
+                            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                data = Uri.parse("package:${context.packageName}")
+                            }
+                            context.startActivity(intent)
+                        }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Battery optimization is ON",
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                                Text(
+                                    "Background scanning may stop when screen is off. Tap to disable battery optimization for reliable beacon detection.",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f)
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             // Notifications
@@ -182,6 +377,62 @@ fun SettingsScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showCrashDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    if (showErrorDialog) {
+        AlertDialog(
+            onDismissRequest = { showErrorDialog = false },
+            title = { Text("Error Log") },
+            text = {
+                Text(
+                    text = errorLog.ifBlank { "No errors logged." },
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("error_log", errorLog))
+                    Toast.makeText(context, "Error log copied!", Toast.LENGTH_SHORT).show()
+                }) {
+                    Text("Copy")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showErrorDialog = false }) {
+                    Text("Close")
+                }
+            }
+        )
+    }
+
+    if (showLogcatDialog) {
+        AlertDialog(
+            onDismissRequest = { showLogcatDialog = false },
+            title = { Text("Logcat Errors") },
+            text = {
+                Text(
+                    text = logcatOutput.ifBlank { "No logcat errors found." },
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("logcat_errors", logcatOutput))
+                    Toast.makeText(context, "Logcat errors copied!", Toast.LENGTH_SHORT).show()
+                }) {
+                    Text("Copy")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLogcatDialog = false }) {
                     Text("Close")
                 }
             }
