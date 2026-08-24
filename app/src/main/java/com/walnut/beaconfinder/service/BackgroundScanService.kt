@@ -80,6 +80,7 @@ class BackgroundScanService : Service() {
     private var lastStaleCleanup: Long = 0L
     private var uiDirty = false
     private var uiBatchJob: Job? = null
+    private val lastParseTime = HashMap<String, Long>()
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -331,8 +332,10 @@ class BackgroundScanService : Service() {
     private fun buildScanFilters(): List<ScanFilter> {
         val filters = mutableListOf<ScanFilter>()
 
+        val iBeaconPrefix = byteArrayOf(0x02, 0x15)
+        val iBeaconMask = byteArrayOf(0xFF.toByte(), 0xFF.toByte())
         val iBeaconFilter = ScanFilter.Builder()
-            .setManufacturerData(0x004C, byteArrayOf())
+            .setManufacturerData(0x004C, iBeaconPrefix, iBeaconMask)
             .build()
         filters.add(iBeaconFilter)
 
@@ -567,6 +570,22 @@ class BackgroundScanService : Service() {
         lastScanResultTime = System.currentTimeMillis()
         lastResultTimestamp = System.currentTimeMillis()
 
+        if (result.rssi < MIN_RSSI_THRESHOLD) return
+
+        val address = result.device?.address ?: return
+        val now = System.currentTimeMillis()
+        val lastParsed = lastParseTime[address]
+        if (lastParsed != null && (now - lastParsed) < PARSE_DEDUP_INTERVAL_MS) return
+        lastParseTime[address] = now
+
+        val data = result.scanRecord?.manufacturerSpecificData
+        val serviceData = result.scanRecord?.serviceData
+
+        if ((data == null || data.get(0x004C) == null) &&
+            (serviceData == null || serviceData[ParcelUuid.fromString(EDDYSTONE_SERVICE_UUID)] == null)) {
+            return
+        }
+
         val beacon = try {
             parserEngine.parse(result)
         } catch (e: Exception) {
@@ -581,8 +600,6 @@ class BackgroundScanService : Service() {
             beacon.protocol != BeaconProtocol.EDDYSTONE_EID) {
             return
         }
-
-        val now = System.currentTimeMillis()
 
         val existing = sharedDeviceMap[beacon.address]
         if (existing != null) {
@@ -609,6 +626,9 @@ class BackgroundScanService : Service() {
                 val oldest = sharedDeviceMap.entries.sortedBy { it.value.lastSeen }
                     .take(sharedDeviceMap.size - MAX_DEVICE_CACHE_SIZE)
                 oldest.forEach { sharedDeviceMap.remove(it.key) }
+            }
+            lastParseTime.entries.removeIf { (_, time) ->
+                (now - time) > 30_000L
             }
         }
 
@@ -974,6 +994,8 @@ class BackgroundScanService : Service() {
         private const val STALE_CLEANUP_INTERVAL_MS = 10_000L
         private const val UI_BATCH_INTERVAL_MS = 200L
         private const val MAX_DEVICE_CACHE_SIZE = 100
+        private const val MIN_RSSI_THRESHOLD = -95
+        private const val PARSE_DEDUP_INTERVAL_MS = 500L
         private const val RSSI_THRESHOLD_IN_RANGE = -60
         private const val RSSI_THRESHOLD_OUT_OF_RANGE = -90
 
