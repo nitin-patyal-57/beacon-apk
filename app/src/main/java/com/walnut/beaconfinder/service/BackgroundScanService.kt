@@ -66,6 +66,7 @@ class BackgroundScanService : Service() {
     private var notificationRangeMeters = 50.0
     private var zones = listOf<com.walnut.beaconfinder.data.db.ZoneEntity>()
     private val zonePresenceMap = ConcurrentHashMap<String, MutableSet<String>>()
+    private val zoneBeaconKeysCache = ConcurrentHashMap<String, List<String>>()
     private var mediaPlayer: android.media.MediaPlayer? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -75,6 +76,8 @@ class BackgroundScanService : Service() {
     private var presenceTimeoutJob: Job? = null
     private var bgScanRetryCount = 0
     private var lastScanStartTime: Long = 0L
+    private var lastNotificationUpdate: Long = 0L
+    private var lastStaleCleanup: Long = 0L
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -287,6 +290,13 @@ class BackgroundScanService : Service() {
         scope.launch {
             val db = BeaconDatabase.getInstance(applicationContext)
             zones = db.zoneDao().getAllSync()
+            zoneBeaconKeysCache.clear()
+            for (zone in zones) {
+                try {
+                    val arr = org.json.JSONArray(zone.beaconKeys)
+                    zoneBeaconKeysCache[zone.name] = (0 until arr.length()).map { arr.getString(it) }
+                } catch (_: Exception) {}
+            }
             Log.d(TAG, "Loaded ${zones.size} zones")
         }
     }
@@ -382,8 +392,10 @@ class BackgroundScanService : Service() {
         }
 
         val filters = buildScanFilters()
+        val isScreenOn = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive == true
+        val scanMode = if (isScreenOn) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(scanMode)
             .setReportDelay(0)
             .build()
 
@@ -442,8 +454,7 @@ class BackgroundScanService : Service() {
             bgScanRetryCount = 0
             lastScanResultTime = System.currentTimeMillis()
             isServiceScanning = true
-            updateNotification("Monitoring iBeacon & Eddystone")
-            Log.d(TAG, "Background scan started with ${filters.size} filters")
+            Log.d(TAG, "Background scan started (${filters.size} filters, mode=$scanMode)")
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied starting scan", e)
             ErrorLogManager.logError(TAG, "Permission denied starting BLE scan", e)
@@ -578,8 +589,16 @@ class BackgroundScanService : Service() {
         sharedDeviceMap[beacon.address] = updatedBeacon
         _scannedDevices.value = sharedDeviceMap.toMap()
 
-        sharedDeviceMap.entries.removeIf { (_, device) ->
-            (now - device.lastSeen) > 15_000L
+        if (now - lastStaleCleanup > STALE_CLEANUP_INTERVAL_MS) {
+            lastStaleCleanup = now
+            sharedDeviceMap.entries.removeIf { (_, device) ->
+                (now - device.lastSeen) > 15_000L
+            }
+            if (sharedDeviceMap.size > MAX_DEVICE_CACHE_SIZE) {
+                val oldest = sharedDeviceMap.entries.sortedBy { it.value.lastSeen }
+                    .take(sharedDeviceMap.size - MAX_DEVICE_CACHE_SIZE)
+                oldest.forEach { sharedDeviceMap.remove(it.key) }
+            }
         }
 
         val match = knownBeacons.find { entity ->
@@ -805,6 +824,9 @@ class BackgroundScanService : Service() {
 
     private fun updateNotification(text: String) {
         try {
+            val now = System.currentTimeMillis()
+            if (now - lastNotificationUpdate < NOTIFICATION_UPDATE_MIN_INTERVAL_MS) return
+            lastNotificationUpdate = now
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
             nm.notify(NOTIFICATION_ID, createNotification(text))
         } catch (e: Exception) {
@@ -843,10 +865,7 @@ class BackgroundScanService : Service() {
     private fun checkZones(beaconIdentityKey: String, beaconName: String) {
         for (zone in zones) {
             if (!zone.notificationEnabled) continue
-            val zoneBeacons = try {
-                val arr = org.json.JSONArray(zone.beaconKeys)
-                (0 until arr.length()).map { arr.getString(it) }
-            } catch (_: Exception) { continue }
+            val zoneBeacons = zoneBeaconKeysCache[zone.name] ?: continue
 
             if (beaconIdentityKey in zoneBeacons) {
                 val currentZoneBeacons = zonePresenceMap.getOrPut(zone.name) { mutableSetOf() }
@@ -915,12 +934,15 @@ class BackgroundScanService : Service() {
         const val ACTION_START = "com.walnut.beaconfinder.START_BACKGROUND"
         const val ACTION_STOP = "com.walnut.beaconfinder.STOP_BACKGROUND"
         private const val TTS_COOLDOWN_MS = 3_000L
-        private const val HEALTH_CHECK_INTERVAL_MS = 5_000L
-        private const val HEALTH_CHECK_TIMEOUT_MS = 10_000L
+        private const val HEALTH_CHECK_INTERVAL_MS = 10_000L
+        private const val HEALTH_CHECK_TIMEOUT_MS = 20_000L
         private const val EDDYSTONE_SERVICE_UUID = "0000FEAA-0000-1000-8000-00805F9B34FB"
         private const val MIN_SCAN_START_INTERVAL_MS = 5_000L
-        private const val PRESENCE_CHECK_INTERVAL_MS = 5_000L
+        private const val PRESENCE_CHECK_INTERVAL_MS = 10_000L
         private const val PRESENCE_TIMEOUT_MS = 30_000L
+        private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 5_000L
+        private const val STALE_CLEANUP_INTERVAL_MS = 10_000L
+        private const val MAX_DEVICE_CACHE_SIZE = 100
         private const val RSSI_THRESHOLD_IN_RANGE = -60
         private const val RSSI_THRESHOLD_OUT_OF_RANGE = -90
 
