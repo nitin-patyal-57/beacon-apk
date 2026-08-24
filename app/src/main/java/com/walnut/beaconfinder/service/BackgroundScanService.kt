@@ -74,6 +74,10 @@ class BackgroundScanService : Service() {
     private var notificationGroupingEnabled = true
     private var lastScanHistorySave: Long = 0L
     private var batteryLevel: Int = 100
+    private var packetCount: Long = 0L
+    private var packetCountPerSecond: Int = 0
+    private var lastPacketCountReset: Long = System.currentTimeMillis()
+    private var lastPacketCountAtReset: Long = 0L
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -586,10 +590,18 @@ class BackgroundScanService : Service() {
         lastScanResultTime = System.currentTimeMillis()
         lastResultTimestamp = System.currentTimeMillis()
 
+        packetCount++
+        val now = System.currentTimeMillis()
+        if (now - lastPacketCountReset >= 1000) {
+            packetCountPerSecond = (packetCount - lastPacketCountAtReset).toInt()
+            lastPacketCountAtReset = packetCount
+            lastPacketCountReset = now
+            _packetStats.value = Pair(packetCount, packetCountPerSecond)
+        }
+
         if (result.rssi < MIN_RSSI_THRESHOLD) return
 
         val address = result.device?.address ?: return
-        val now = System.currentTimeMillis()
         val lastParsed = lastParseTime[address]
         if (lastParsed != null && (now - lastParsed) < PARSE_DEDUP_INTERVAL_MS) return
         lastParseTime[address] = now
@@ -1116,6 +1128,9 @@ class BackgroundScanService : Service() {
 
         @Volatile
         private var lastResultTimestamp: Long = 0L
+
+        private val _packetStats = MutableStateFlow(Pair(0L, 0))
+        val packetStats: StateFlow<Pair<Long, Int>> = _packetStats.asStateFlow()
 
         fun isScanAlive(): Boolean {
             if (!isServiceScanning) return false

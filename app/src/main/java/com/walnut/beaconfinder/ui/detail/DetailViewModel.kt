@@ -123,6 +123,18 @@ class DetailViewModel @Inject constructor(
         }
     }
 
+    fun setConnectionPriority(priority: Int) {
+        connectionManager.setConnectionPriority(address, priority)
+    }
+
+    fun requestMtu(mtu: Int) {
+        connectionManager.requestMtu(address, mtu)
+    }
+
+    fun readRemoteRssi() {
+        connectionManager.readRemoteRssi(address)
+    }
+
     fun getDistance(): String? {
         val dev = _device.value.device ?: return null
         val txPower = dev.txPower ?: return null

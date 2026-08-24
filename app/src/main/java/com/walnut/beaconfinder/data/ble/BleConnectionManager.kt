@@ -222,6 +222,23 @@ class BleConnectionManager @Inject constructor(
         }
     }
 
+    @SuppressLint("MissingPermission")
+    fun setConnectionPriority(address: String, priority: Int): Boolean {
+        val conn = connections[address] ?: return false
+        return try {
+            val connPriority = when (priority) {
+                0 -> android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH
+                1 -> android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+                2 -> android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER
+                else -> android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_BALANCED
+            }
+            conn.bluetoothGatt.requestConnectionPriority(connPriority)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error setting connection priority", e)
+            false
+        }
+    }
+
     fun isConnected(address: String): Boolean {
         val conn = connections[address] ?: return false
         return conn.connectionState == ConnectionState.CONNECTED ||

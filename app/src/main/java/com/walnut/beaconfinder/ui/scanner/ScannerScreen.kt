@@ -575,6 +575,7 @@ fun SystemStatusCard() {
     var locationGranted by remember { mutableStateOf(false) }
     var batteryOptimal by remember { mutableStateOf(true) }
     var serviceRunning by remember { mutableStateOf(false) }
+    val packetStats by com.walnut.beaconfinder.service.BackgroundScanService.packetStats.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
         val btManager = context.getSystemService(android.content.Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
@@ -613,6 +614,15 @@ fun SystemStatusCard() {
             StatusItem("Location Permission", locationGranted)
             StatusItem("Battery Optimization", batteryOptimal)
             StatusItem("Background Service", serviceRunning)
+            if (serviceRunning) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Packets: ${packetStats.first} total · ${packetStats.second}/sec",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+                )
+            }
         }
     }
 }

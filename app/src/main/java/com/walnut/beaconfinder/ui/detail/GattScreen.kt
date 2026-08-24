@@ -38,6 +38,8 @@ fun GattScreen(
     var writeDialogChar by remember { mutableStateOf<GattCharacteristicInfo?>(null) }
     var writeValue by remember { mutableStateOf("") }
     var notificationEnabledChars by remember { mutableStateOf(setOf<String>()) }
+    var mtuValue by remember { mutableIntStateOf(512) }
+    var connectionPriority by remember { mutableIntStateOf(0) }
 
     fun findCharacteristic(charInfo: GattCharacteristicInfo): BluetoothGattCharacteristic? {
         for (service in services) {
@@ -140,6 +142,73 @@ fun GattScreen(
                             text = "ASCII: ${String(value, Charsets.UTF_8)}",
                             fontSize = 11.sp
                         )
+                    }
+                }
+            }
+
+            // Developer Tools
+            if (connectionState == ConnectionState.READY) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(8.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Developer Tools", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Connection Priority
+                        Text("Connection Priority", fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            listOf(0 to "HIGH", 1 to "BALANCED", 2 to "LOW").forEach { (value, label) ->
+                                FilterChip(
+                                    selected = connectionPriority == value,
+                                    onClick = {
+                                        connectionPriority = value
+                                        viewModel.setConnectionPriority(value)
+                                    },
+                                    label = { Text(label, fontSize = 10.sp) }
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // MTU
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = mtuValue.toString(),
+                                onValueChange = { mtuValue = it.toIntOrNull() ?: 512 },
+                                label = { Text("MTU") },
+                                modifier = Modifier.weight(1f),
+                                singleLine = true
+                            )
+                            FilledTonalButton(
+                                onClick = { viewModel.requestMtu(mtuValue) }
+                            ) {
+                                Text("Request MTU", fontSize = 11.sp)
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        // Read RSSI
+                        FilledTonalButton(
+                            onClick = { viewModel.readRemoteRssi() },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.SignalCellularAlt, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Read Remote RSSI", fontSize = 11.sp)
+                        }
                     }
                 }
             }
