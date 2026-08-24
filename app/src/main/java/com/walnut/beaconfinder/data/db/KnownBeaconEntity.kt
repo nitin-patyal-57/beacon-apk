@@ -21,5 +21,6 @@ data class KnownBeaconEntity(
     val presenceTimeoutMs: Long = 30_000L,
     val minRssi: Int = -80,
     val gattServiceUuid: String? = null,
-    val maxRetries: Int = 3
+    val maxRetries: Int = 3,
+    val soundUri: String? = null
 )

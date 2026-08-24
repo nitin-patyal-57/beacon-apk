@@ -11,9 +11,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.walnut.beaconfinder.data.db.KnownBeaconEntity
@@ -158,6 +161,7 @@ fun KnownBeaconCard(
             Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 DetailItem("Notify", if (beacon.notificationEnabled) "ON" else "OFF")
                 DetailItem("Auto Connect", if (beacon.autoConnectEnabled) "ON" else "OFF")
+                DetailItem("Sound", if (beacon.soundUri != null) "Custom" else "TTS")
             }
             DetailItem("Min RSSI", "${beacon.minRssi} dBm")
         }
@@ -215,6 +219,17 @@ fun AddEditBeaconDialog(
     var autoConnectEnabled by remember { mutableStateOf(beacon?.autoConnectEnabled ?: false) }
     var minRssi by remember { mutableStateOf(beacon?.minRssi?.toString() ?: "-80") }
     var timeout by remember { mutableStateOf((beacon?.presenceTimeoutMs ?: 30000L).toString()) }
+    var soundUri by remember { mutableStateOf(beacon?.soundUri ?: "") }
+
+    val context = LocalContext.current
+    val ringtoneLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uri = result.data?.getParcelableExtra<android.net.Uri>(
+            android.media.RingtoneManager.EXTRA_RINGTONE_PICKED_URI
+        )
+        soundUri = uri?.toString() ?: ""
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -330,6 +345,42 @@ fun AddEditBeaconDialog(
                     Text("Automatic Connection")
                 }
 
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("Custom Sound", fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                        Text(
+                            if (soundUri.isNotBlank()) "Custom ringtone set" else "Default TTS",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        )
+                    }
+                    Row {
+                        if (soundUri.isNotBlank()) {
+                            TextButton(onClick = { soundUri = "" }) {
+                                Text("Clear", fontSize = 12.sp)
+                            }
+                        }
+                        TextButton(onClick = {
+                            val intent = android.content.Intent(android.media.RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+                                putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
+                                putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+                                putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_TYPE, android.media.RingtoneManager.TYPE_ALL)
+                                if (soundUri.isNotBlank()) {
+                                    putExtra(android.media.RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, android.net.Uri.parse(soundUri))
+                                }
+                            }
+                            ringtoneLauncher.launch(intent)
+                        }) {
+                            Text("Pick Sound", fontSize = 12.sp)
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(4.dp))
                 OutlinedTextField(
                     value = minRssi,
@@ -371,7 +422,8 @@ fun AddEditBeaconDialog(
                                 notificationEnabled = notificationEnabled,
                                 autoConnectEnabled = autoConnectEnabled,
                                 minRssi = minRssi.toIntOrNull() ?: -80,
-                                presenceTimeoutMs = timeout.toLongOrNull() ?: 30000L
+                                presenceTimeoutMs = timeout.toLongOrNull() ?: 30000L,
+                                soundUri = soundUri.ifBlank { null }
                             )
                         )
                     }

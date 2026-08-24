@@ -64,6 +64,9 @@ class BackgroundScanService : Service() {
     private var quietHoursStart = 22
     private var quietHoursEnd = 7
     private var notificationRangeMeters = 50.0
+    private var zones = listOf<com.walnut.beaconfinder.data.db.ZoneEntity>()
+    private val zonePresenceMap = ConcurrentHashMap<String, MutableSet<String>>()
+    private var mediaPlayer: android.media.MediaPlayer? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -101,6 +104,7 @@ class BackgroundScanService : Service() {
         scope.launch {
             loadKnownBeacons()
             loadCustomFormats()
+            loadZones()
         }
     }
 
@@ -275,6 +279,15 @@ class BackgroundScanService : Service() {
                 )
             }
             parserEngine.setCustomFormats(formats)
+            Log.d(TAG, "Reloaded ${formats.size} custom formats")
+        }
+    }
+
+    private fun loadZones() {
+        scope.launch {
+            val db = BeaconDatabase.getInstance(applicationContext)
+            zones = db.zoneDao().getAllSync()
+            Log.d(TAG, "Loaded ${zones.size} zones")
         }
     }
 
@@ -630,6 +643,16 @@ class BackgroundScanService : Service() {
             }
         }
 
+        if (zone == RssiZone.IN_RANGE && match?.soundUri != null) {
+            if (cooldownTracker.canNotify("sound:${beacon.identityKey}", 10_000L)) {
+                playCustomSound(match.soundUri)
+            }
+        }
+
+        if (zone == RssiZone.IN_RANGE) {
+            checkZones(beacon.identityKey, beaconName)
+        }
+
         val presence = presenceTracker.updatePresence(
             beacon,
             timeoutMs = match?.presenceTimeoutMs ?: PRESENCE_TIMEOUT_MS,
@@ -726,6 +749,26 @@ class BackgroundScanService : Service() {
         nm.notify(id, notification)
     }
 
+    private fun sendZoneNotification(zoneName: String, action: String) {
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
+            .setContentTitle("Zone Alert")
+            .setContentText("You have $action the $zoneName zone")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val id = NOTIFICATION_ID_BEACON + 30000 + (System.nanoTime().toInt() and 0x7FFF)
+        nm.notify(id, notification)
+    }
+
     private fun stopBackgroundScan() {
         healthCheckJob?.cancel()
         healthCheckJob = null
@@ -773,6 +816,52 @@ class BackgroundScanService : Service() {
         val cleanHex = hex.replace(" ", "")
         return ByteArray(cleanHex.length / 2) { i ->
             cleanHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun playCustomSound(uri: String?) {
+        if (uri == null) return
+        try {
+            mediaPlayer?.release()
+            mediaPlayer = android.media.MediaPlayer().apply {
+                setDataSource(applicationContext, android.net.Uri.parse(uri))
+                setAudioAttributes(
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_ALARM)
+                        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+                prepare()
+                start()
+                setOnCompletionListener { it.release() }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to play custom sound: $uri", e)
+        }
+    }
+
+    private fun checkZones(beaconIdentityKey: String, beaconName: String) {
+        for (zone in zones) {
+            if (!zone.notificationEnabled) continue
+            val zoneBeacons = try {
+                val arr = org.json.JSONArray(zone.beaconKeys)
+                (0 until arr.length()).map { arr.getString(it) }
+            } catch (_: Exception) { continue }
+
+            if (beaconIdentityKey in zoneBeacons) {
+                val currentZoneBeacons = zonePresenceMap.getOrPut(zone.name) { mutableSetOf() }
+                val wasEmpty = currentZoneBeacons.isEmpty()
+                currentZoneBeacons.add(beaconIdentityKey)
+
+                if (wasEmpty && currentZoneBeacons.isNotEmpty()) {
+                    if (!isQuietHours()) {
+                        speak("Entering ${zone.name}")
+                    }
+                    if (cooldownTracker.canNotify("zone:${zone.name}", 60_000L)) {
+                        sendZoneNotification(zone.name, "entered")
+                    }
+                }
+            }
         }
     }
 

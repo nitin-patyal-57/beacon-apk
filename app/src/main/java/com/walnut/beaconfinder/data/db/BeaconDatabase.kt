@@ -11,9 +11,10 @@ import androidx.room.RoomDatabase
         CustomFormatEntity::class,
         FavoriteEntity::class,
         BeaconNameEntity::class,
-        AlertHistoryEntity::class
+        AlertHistoryEntity::class,
+        ZoneEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class BeaconDatabase : RoomDatabase() {
@@ -22,6 +23,7 @@ abstract class BeaconDatabase : RoomDatabase() {
     abstract fun favoriteDao(): FavoriteDao
     abstract fun beaconNameDao(): BeaconNameDao
     abstract fun alertHistoryDao(): AlertHistoryDao
+    abstract fun zoneDao(): ZoneDao
 
     companion object {
         @Volatile
