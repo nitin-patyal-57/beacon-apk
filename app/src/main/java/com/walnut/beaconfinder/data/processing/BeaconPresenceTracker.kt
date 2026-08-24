@@ -69,17 +69,21 @@ class BeaconPresenceTracker @Inject constructor() {
         return existing
     }
 
-    fun checkTimeouts(timeoutMs: Long = 30_000L) {
+    fun checkTimeouts(timeoutMs: Long = 30_000L): List<PresenceInfo> {
         val now = System.currentTimeMillis()
+        val timedOut = mutableListOf<PresenceInfo>()
         for ((key, info) in presenceMap) {
             if (info.presenceState != PresenceState.NOT_PRESENT &&
+                info.presenceState != PresenceState.LOST &&
                 (now - info.lastSeenTimestamp) > timeoutMs
             ) {
                 info.previousState = info.presenceState
                 info.presenceState = PresenceState.LOST
+                timedOut.add(info)
                 Log.d(TAG, "Timeout: ${info.beaconName} -> LOST")
             }
         }
+        return timedOut
     }
 
     fun getPresence(identityKey: String): PresenceInfo? = presenceMap[identityKey]

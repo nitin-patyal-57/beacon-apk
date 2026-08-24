@@ -17,7 +17,11 @@ class BluetoothStateReceiver : BroadcastReceiver() {
                 BluetoothAdapter.STATE_ON -> {
                     Log.d(TAG, "Bluetooth ON → starting background scan")
                     ScanWatchdogReceiver.schedule(context)
-                    BackgroundScanService.start(context)
+                    try {
+                        BackgroundScanService.start(context)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to start service from BT receiver", e)
+                    }
                 }
                 BluetoothAdapter.STATE_OFF -> {
                     Log.d(TAG, "Bluetooth OFF → scan will stop internally in service")

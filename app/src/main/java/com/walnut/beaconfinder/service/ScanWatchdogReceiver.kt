@@ -13,12 +13,6 @@ class ScanWatchdogReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         Log.d(TAG, "Watchdog fired")
 
-        val prefs = context.getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(BootReceiver.KEY_MONITORING_ENABLED, false)) {
-            Log.d(TAG, "Monitoring disabled, skipping")
-            return
-        }
-
         schedule(context)
 
         if (!isBluetoothEnabled(context)) {
@@ -31,21 +25,16 @@ class ScanWatchdogReceiver : BroadcastReceiver() {
             return
         }
 
-        val serviceAlive = prefs.getBoolean(KEY_SERVICE_ALIVE, false)
-        val lastAlive = prefs.getLong(KEY_LAST_ALIVE_TIME, 0)
-        val now = System.currentTimeMillis()
-        val staleMs = now - lastAlive
-
-        if (serviceAlive && staleMs < SERVICE_STALE_TIMEOUT_MS) {
-            Log.d(TAG, "Service alive (${staleMs / 1000}s ago), skipping restart")
-        } else {
-            Log.w(TAG, "Service dead or stale (${staleMs / 1000}s), restarting!")
-            restartService(context)
-        }
+        Log.d(TAG, "BT on, restarting service")
+        restartService(context)
     }
 
     private fun restartService(context: Context) {
-        BackgroundScanService.start(context)
+        try {
+            BackgroundScanService.start(context)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to restart service from watchdog", e)
+        }
     }
 
     private fun isBluetoothEnabled(context: Context): Boolean {
@@ -73,7 +62,7 @@ class ScanWatchdogReceiver : BroadcastReceiver() {
         const val KEY_SERVICE_ALIVE = "service_alive"
         const val KEY_LAST_ALIVE_TIME = "last_alive_time"
         private const val SERVICE_STALE_TIMEOUT_MS = 120_000L
-        private const val WATCHDOG_INTERVAL_MS = 2 * 60 * 1000L
+        private const val WATCHDOG_INTERVAL_MS = 30_000L
 
         fun schedule(context: Context) {
             val intent = Intent(context, ScanWatchdogReceiver::class.java)

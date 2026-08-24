@@ -18,9 +18,11 @@ import android.util.Log
 import com.walnut.beaconfinder.data.model.BeaconDevice
 import com.walnut.beaconfinder.data.model.BeaconProtocol
 import com.walnut.beaconfinder.data.parser.BeaconParserEngine
+import com.walnut.beaconfinder.service.BackgroundScanService
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +63,8 @@ class BleScannerManager @Inject constructor(
     private var pendingUiUpdate = false
     private var onDeviceOutOfRange: ((String) -> Unit)? = null
     private var lastStaleCleanupAt: Long = 0L
+    private var serviceObservingJob: Job? = null
+    private var isObservingService = false
 
     fun setOnDeviceOutOfRangeListener(listener: (String) -> Unit) {
         onDeviceOutOfRange = listener
@@ -91,17 +95,68 @@ class BleScannerManager @Inject constructor(
     private var scanRetryRunnable: Runnable? = null
 
     fun startScan() {
-        if (_isScanning.value) return
+        if (_isScanning.value) {
+            if (isObservingService && BackgroundScanService.isScanAlive()) {
+                return
+            }
+            Log.d(TAG, "Scan flag was stale (service dead), resetting and restarting")
+            stopScan()
+        }
+
         isAnyScanRunning = false
 
-        scope.launch {
-            delay(1500)
-            startScanInternal()
+        BackgroundScanService.start(context)
+        observeServiceResults()
+    }
+
+    private fun observeServiceResults() {
+        isObservingService = true
+        _isScanning.value = true
+        _scanError.value = null
+        serviceObservingJob?.cancel()
+        serviceObservingJob = scope.launch {
+            val startTime = System.currentTimeMillis()
+            while (!BackgroundScanService.isScanAlive() && System.currentTimeMillis() - startTime < 5000) {
+                delay(500)
+            }
+            if (!BackgroundScanService.isScanAlive()) {
+                Log.w(TAG, "Service scan not alive after 5s, force restarting")
+                BackgroundScanService.forceRestart(context)
+                delay(3000)
+            }
+            BackgroundScanService.scannedDevices.collect { serviceDevices ->
+                deviceMap.clear()
+                synchronized(deviceOrder) { deviceOrder.clear() }
+                val now = System.currentTimeMillis()
+                for ((addr, device) in serviceDevices) {
+                    deviceMap[addr] = device
+                    synchronized(deviceOrder) {
+                        if (addr !in deviceOrder) deviceOrder.add(addr)
+                    }
+                }
+                deviceMap.entries.removeIf { (_, device) ->
+                    (now - device.lastSeen) > STALE_DEVICE_MS
+                }
+                scheduleUiUpdate()
+            }
         }
+        Log.d(TAG, "Observing service scan results")
+    }
+
+    fun stopObservingService() {
+        serviceObservingJob?.cancel()
+        serviceObservingJob = null
+        isObservingService = false
     }
 
     private fun startScanInternal(retryAttempt: Int = 0) {
         if (_isScanning.value) return
+
+        if (BackgroundScanService.isServiceScanning) {
+            Log.d(TAG, "Service started scanning during delay, observing instead")
+            observeServiceResults()
+            return
+        }
 
         if (!hasBluetoothConnectPermission()) {
             _scanError.value = "Bluetooth Connect permission not granted"
@@ -211,6 +266,12 @@ class BleScannerManager @Inject constructor(
     }
 
     fun stopScan() {
+        if (isObservingService) {
+            stopObservingService()
+            _isScanning.value = false
+            Log.d(TAG, "Stopped observing service scan results")
+            return
+        }
         try {
             scanCallback?.let { scanner?.stopScan(it) }
         } catch (e: Exception) {

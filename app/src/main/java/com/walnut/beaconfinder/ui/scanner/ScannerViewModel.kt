@@ -90,16 +90,6 @@ class ScannerViewModel @Inject constructor(
         }
 
         viewModelScope.launch {
-            bluetoothStateObserver.btTurnedOn.collect {
-                if (!settingsRepo.monitoringEnabled.value && !scannerManager.isScanning.value) {
-                    Log.d(TAG, "BT turned on → auto-starting foreground scan")
-                    delay(1000)
-                    startScan()
-                }
-            }
-        }
-
-        viewModelScope.launch {
             customFormatRepo.getAll().forEach { entity ->
                 CustomBeaconParser.CustomFormat(
                     name = entity.name,
@@ -133,14 +123,6 @@ class ScannerViewModel @Inject constructor(
         scannerManager.stopScan()
         stopProximityTracking()
         stopAutoRefresh()
-        restartBackgroundIfNeeded()
-    }
-
-    private fun restartBackgroundIfNeeded() {
-        if (settingsRepo.monitoringEnabled.value) {
-            Log.d(TAG, "Foreground scan stopped → restarting background scan")
-            BackgroundScanService.start(getApplication())
-        }
     }
 
     fun toggleAutoConnect() {
@@ -298,7 +280,6 @@ class ScannerViewModel @Inject constructor(
         stopProximityTracking()
         stopAutoRefresh()
         ttsManager.stop()
-        restartBackgroundIfNeeded()
         super.onCleared()
     }
 

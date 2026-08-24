@@ -97,6 +97,26 @@ fun ScannerScreen(
         }
     }
 
+    LaunchedEffect(Unit) {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 31) {
+            needed.add(Manifest.permission.BLUETOOTH_SCAN)
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        needed.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (Build.VERSION.SDK_INT >= 33) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val alreadyGranted = needed.all {
+            context.checkSelfPermission(it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        if (alreadyGranted) {
+            permissionsGranted = true
+        } else {
+            requestPermissions()
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(

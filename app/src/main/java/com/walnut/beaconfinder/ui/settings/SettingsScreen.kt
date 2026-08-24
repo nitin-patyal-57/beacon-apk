@@ -259,7 +259,7 @@ fun SettingsScreen(
             }
 
             // Battery Optimization Warning
-            if (isBatteryOptimized && monitoringEnabled) {
+            if (isBatteryOptimized) {
                 SettingsSection("Battery Optimization") {
                     Card(
                         modifier = Modifier

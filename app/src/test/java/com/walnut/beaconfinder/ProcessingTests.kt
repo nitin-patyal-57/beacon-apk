@@ -212,29 +212,29 @@ class ProcessingTests {
     )
 
     @Test
-    fun `initial state is OUTSIDE`() {
-        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+    fun `initial state is UNKNOWN`() {
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
     }
 
     @Test
-    fun `packet with RSSI >= -80 transitions to IN_RANGE`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
-        val result = tracker.checkAndAnnounce(listOf(beacon))
+    fun `strong RSSI transitions to IN_RANGE after confirmation count`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -50)
+        tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
+        tracker.checkAndAnnounce(listOf(beacon))
         assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
-        assertNotNull(result)
     }
 
     @Test
-    fun `packet with RSSI < -80 stays OUT`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -90)
-        val result = tracker.checkAndAnnounce(listOf(beacon))
-        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
-        assertNull(result)
+    fun `weak RSSI does not transition immediately from UNKNOWN`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -95)
+        tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
     }
 
     @Test
     fun `stays IN_RANGE while packets with good RSSI arrive`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -50)
         tracker.checkAndAnnounce(listOf(beacon))
         tracker.checkAndAnnounce(listOf(beacon))
         tracker.checkAndAnnounce(listOf(beacon))
@@ -243,12 +243,12 @@ class ProcessingTests {
 
     @Test
     fun `weak packet does not change state when IN_RANGE`() {
-        val strong = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val strong = createBeacon("AA:BB:CC:DD:EE:FF", -50)
+        tracker.checkAndAnnounce(listOf(strong))
         tracker.checkAndAnnounce(listOf(strong))
         assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
 
-        // Weak packet - should not exit immediately
-        val weak = createBeacon("AA:BB:CC:DD:EE:FF", -90)
+        val weak = createBeacon("AA:BB:CC:DD:EE:FF", -95)
         tracker.checkAndAnnounce(listOf(weak))
         assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
     }
@@ -256,7 +256,7 @@ class ProcessingTests {
     @Test
     fun `returns null when disabled`() {
         tracker.setEnabled(false)
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -50)
         val result = tracker.checkAndAnnounce(listOf(beacon))
         assertNull(result)
     }
@@ -270,48 +270,32 @@ class ProcessingTests {
         )
         val result = tracker.checkAndAnnounce(listOf(genericBeacon))
         assertNull(result)
-        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
     }
 
     @Test
     fun `reset clears all state`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -70)
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -50)
+        tracker.checkAndAnnounce(listOf(beacon))
         tracker.checkAndAnnounce(listOf(beacon))
         assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
 
         tracker.reset()
-        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
     }
 
     @Test
-    fun `last in range packet time is updated only for strong packets`() {
-        val strong = createBeacon("AA:BB:CC:DD:EE:FF", -70)
-        val before = System.currentTimeMillis()
-        tracker.checkAndAnnounce(listOf(strong))
-        val after = System.currentTimeMillis()
-
-        assertTrue(tracker.getLastInRangePacketTime() in before..after)
-
-        // Weak packet should NOT update time
-        val weak = createBeacon("AA:BB:CC:DD:EE:FF", -90)
-        val timeBeforeWeak = tracker.getLastInRangePacketTime()
-        tracker.checkAndAnnounce(listOf(weak))
-        assertEquals(timeBeforeWeak, tracker.getLastInRangePacketTime())
-    }
-
-    @Test
-    fun `boundary RSSI at -80 is accepted`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -80)
-        val result = tracker.checkAndAnnounce(listOf(beacon))
+    fun `boundary RSSI at -60 is accepted`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -60)
+        tracker.checkAndAnnounce(listOf(beacon))
+        tracker.checkAndAnnounce(listOf(beacon))
         assertEquals(NearestBeaconTracker.RangeState.IN_RANGE, tracker.getRangeState())
-        assertNotNull(result)
     }
 
     @Test
-    fun `boundary RSSI at -81 is rejected`() {
-        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -81)
-        val result = tracker.checkAndAnnounce(listOf(beacon))
-        assertEquals(NearestBeaconTracker.RangeState.OUTSIDE, tracker.getRangeState())
-        assertNull(result)
+    fun `boundary RSSI at -61 is silent zone`() {
+        val beacon = createBeacon("AA:BB:CC:DD:EE:FF", -61)
+        tracker.checkAndAnnounce(listOf(beacon))
+        assertEquals(NearestBeaconTracker.RangeState.UNKNOWN, tracker.getRangeState())
     }
 }

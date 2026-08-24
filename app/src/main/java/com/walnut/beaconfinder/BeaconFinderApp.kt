@@ -34,17 +34,57 @@ class BeaconFinderApp : Application() {
         setupCrashHandler()
         bluetoothStateObserver.start()
         autoStartMonitoringIfNeeded()
+        promptBatteryOptimization()
+        promptNotificationPermission()
     }
 
     private fun autoStartMonitoringIfNeeded() {
-        val prefs = getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
-        if (prefs.getBoolean(BootReceiver.KEY_MONITORING_ENABLED, false)) {
-            val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-            if (btManager?.adapter?.isEnabled == true) {
-                Log.d(TAG, "Monitoring enabled + BT on → starting background scan service")
-                BackgroundScanService.start(this)
+        val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        if (btManager?.adapter?.isEnabled == true) {
+            Log.d(TAG, "BT on at startup → starting background scan service")
+            BackgroundScanService.start(this)
+        }
+        ScanWatchdogReceiver.schedule(this)
+    }
+
+    private fun promptBatteryOptimization() {
+        val prefs = getSharedPreferences("beacon_finder_prefs", MODE_PRIVATE)
+        if (prefs.getBoolean("battery_opt_prompted", false)) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    val intent = android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = android.net.Uri.parse("package:$packageName")
+                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                    prefs.edit().putBoolean("battery_opt_prompted", true).apply()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to request battery optimization exemption", e)
+                }
             }
-            ScanWatchdogReceiver.schedule(this)
+        }
+    }
+
+    private fun promptNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            val prefs = getSharedPreferences("beacon_finder_prefs", MODE_PRIVATE)
+            if (prefs.getBoolean("notif_perm_prompted", false)) return
+            val hasPerm = checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            if (!hasPerm) {
+                try {
+                    val intent = android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                        putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, packageName)
+                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                    prefs.edit().putBoolean("notif_perm_prompted", true).apply()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to open notification settings", e)
+                }
+            }
         }
     }
 
@@ -79,7 +119,7 @@ class BeaconFinderApp : Application() {
         val monitoringChannel = NotificationChannel(
             CHANNEL_MONITORING,
             "Background Monitoring",
-            NotificationManager.IMPORTANCE_LOW
+            NotificationManager.IMPORTANCE_DEFAULT
         ).apply {
             description = "Background BLE monitoring status"
         }

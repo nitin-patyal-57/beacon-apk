@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.util.Log
-import com.walnut.beaconfinder.data.repository.SettingsRepository
 import com.walnut.beaconfinder.service.BackgroundScanService
 import com.walnut.beaconfinder.service.ScanWatchdogReceiver
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -22,8 +21,7 @@ import javax.inject.Singleton
 
 @Singleton
 class BluetoothStateObserver @Inject constructor(
-    @ApplicationContext private val context: Context,
-    private val settingsRepo: SettingsRepository
+    @ApplicationContext private val context: Context
 ) {
     private val _isEnabled = MutableStateFlow(false)
     val isEnabled: StateFlow<Boolean> = _isEnabled.asStateFlow()
@@ -54,14 +52,17 @@ class BluetoothStateObserver @Inject constructor(
                     }
 
                     _isEnabled.value = btEnabled
-                    val ctx = context ?: this@BluetoothStateObserver.context
                     if (btEnabled) {
                         _btTurnedOn.tryEmit(Unit)
-                        Log.d(TAG, "Bluetooth ON → starting background scan")
-                        BackgroundScanService.start(ctx)
-                        ScanWatchdogReceiver.schedule(ctx)
+                        Log.d(TAG, "Bluetooth ON → starting scan service + emitting event")
+                        ScanWatchdogReceiver.schedule(this@BluetoothStateObserver.context)
+                        try {
+                            BackgroundScanService.start(this@BluetoothStateObserver.context)
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to start service from observer", e)
+                        }
                     } else {
-                        Log.d(TAG, "Bluetooth OFF → scan will stop internally in service")
+                        Log.d(TAG, "Bluetooth OFF → service handles internally")
                     }
                 }
             }
@@ -69,9 +70,19 @@ class BluetoothStateObserver @Inject constructor(
     }
 
     fun start() {
-        _isEnabled.value = bluetoothAdapter?.isEnabled == true
+        val btOn = bluetoothAdapter?.isEnabled == true
+        _isEnabled.value = btOn
         val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
         context.registerReceiver(receiver, filter)
+        if (btOn) {
+            Log.d(TAG, "BT already ON at startup → starting scan service")
+            ScanWatchdogReceiver.schedule(context)
+            try {
+                BackgroundScanService.start(context)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to start service at startup", e)
+            }
+        }
     }
 
     fun stop() {

@@ -40,6 +40,9 @@ import com.walnut.beaconfinder.data.parser.CustomBeaconParser
 import com.walnut.beaconfinder.data.processing.BeaconPresenceTracker
 import com.walnut.beaconfinder.data.processing.CooldownTracker
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -62,6 +65,7 @@ class BackgroundScanService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var lastScanResultTime: Long = 0L
     private var healthCheckJob: Job? = null
+    private var presenceTimeoutJob: Job? = null
     private var bgScanRetryCount = 0
     private var lastScanStartTime: Long = 0L
 
@@ -74,34 +78,43 @@ class BackgroundScanService : Service() {
 
     private var btStateReceiver: BroadcastReceiver? = null
 
-    private enum class RangeState { UNKNOWN, IN_RANGE, TEMPORARILY_LOST, OUT_OF_RANGE }
-    private var rangeState = RangeState.UNKNOWN
-    private var confirmedLostAt: Long = 0L
-    private var inRangeCount = 0
-    private var outOfRangeCount = 0
-    private var trackedAddress: String? = null
-
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "BackgroundScanService created")
-        try {
-            startForeground(NOTIFICATION_ID, createNotification("Monitoring active"))
-        } catch (e: SecurityException) {
-            Log.e(TAG, "Cannot start foreground service - missing permissions", e)
-            stopSelf()
-            return
-        }
+        doStartForeground()
         acquireWakeLock()
         initTts()
         setServiceAlive(true)
         ScanWatchdogReceiver.schedule(this)
         startHeartbeat()
+        startHealthCheck()
+        startPresenceTimeoutChecker()
         registerBtStateReceiver()
         scope.launch {
             loadKnownBeacons()
             loadCustomFormats()
+        }
+    }
+
+    private fun doStartForeground() {
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    createNotification("Monitoring active"),
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, createNotification("Monitoring active"))
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Cannot start foreground service - missing permissions", e)
+            ErrorLogManager.logError(TAG, "Cannot start foreground service - missing permissions", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground failed, continuing as background service", e)
+            ErrorLogManager.logWarning(TAG, "startForeground failed: ${e.message}")
         }
     }
 
@@ -115,7 +128,7 @@ class BackgroundScanService : Service() {
                             Log.d(TAG, "BT turned ON internally → restarting scan")
                             scope.launch {
                                 delay(1000)
-                                startBackgroundScan()
+                                startBackgroundScan(forceRestart = true)
                             }
                         }
                         BluetoothAdapter.STATE_OFF -> {
@@ -160,11 +173,15 @@ class BackgroundScanService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startBackgroundScan()
+            ACTION_START -> {
+                doStartForeground()
+                startBackgroundScan(forceRestart = true)
+            }
             ACTION_STOP -> stopBackgroundScan()
             null -> {
                 Log.d(TAG, "Service recreated by system (START_STICKY), restarting scan")
-                startBackgroundScan()
+                doStartForeground()
+                startBackgroundScan(forceRestart = true)
             }
         }
         return START_STICKY
@@ -198,7 +215,12 @@ class BackgroundScanService : Service() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        Log.d(TAG, "Task removed, service continues running as foreground service")
+        Log.d(TAG, "Task removed, rescheduling watchdog + restarting service")
+        ScanWatchdogReceiver.schedule(this)
+        scope.launch {
+            delay(1000)
+            startBackgroundScan(forceRestart = true)
+        }
     }
 
     private fun setServiceAlive(alive: Boolean) {
@@ -212,9 +234,8 @@ class BackgroundScanService : Service() {
     private fun startHeartbeat() {
         scope.launch {
             while (isActive) {
-                delay(30_000L)
+                delay(10_000L)
                 setServiceAlive(true)
-                updateNotification("Monitoring iBeacon & Eddystone")
             }
         }
     }
@@ -242,6 +263,31 @@ class BackgroundScanService : Service() {
         }
     }
 
+    fun reloadKnownBeacons() {
+        scope.launch {
+            val db = BeaconDatabase.getInstance(applicationContext)
+            knownBeacons = db.knownBeaconDao().getAll()
+            Log.d(TAG, "Reloaded ${knownBeacons.size} known beacons")
+        }
+    }
+
+    fun reloadCustomFormats() {
+        scope.launch {
+            val db = BeaconDatabase.getInstance(applicationContext)
+            val formats = db.customFormatDao().getAll().map { entity ->
+                CustomBeaconParser.CustomFormat(
+                    name = entity.name,
+                    manufacturerId = entity.manufacturerId,
+                    frameSignature = entity.frameSignatureHex?.let { hexToBytes(it) },
+                    identifierOffset = entity.identifierOffset,
+                    identifierLength = entity.identifierLength
+                )
+            }
+            parserEngine.setCustomFormats(formats)
+            Log.d(TAG, "Reloaded ${formats.size} custom formats")
+        }
+    }
+
     private fun buildScanFilters(): List<ScanFilter> {
         val filters = mutableListOf<ScanFilter>()
 
@@ -262,12 +308,16 @@ class BackgroundScanService : Service() {
         val now = System.currentTimeMillis()
         if (!forceRestart && now - lastScanStartTime < MIN_SCAN_START_INTERVAL_MS) {
             Log.d(TAG, "Scan start throttled (last start was ${(now - lastScanStartTime) / 1000}s ago)")
+            isServiceScanning = false
             return
         }
         if (!forceRestart && scanCallback != null && scanner != null) {
             Log.d(TAG, "Scan already active, skipping restart")
             return
         }
+
+        reloadKnownBeacons()
+        reloadCustomFormats()
 
         if (!hasRequiredPermissions()) {
             Log.w(TAG, "Missing required permissions")
@@ -280,8 +330,7 @@ class BackgroundScanService : Service() {
         val adapter = bluetoothManager?.adapter
 
         if (adapter == null || !adapter.isEnabled) {
-            Log.w(TAG, "Bluetooth not available")
-            ErrorLogManager.logWarning(TAG, "Bluetooth not available or disabled")
+            Log.w(TAG, "Bluetooth not available or disabled - will restart when BT turns on")
             updateNotification("Waiting for Bluetooth...")
             return
         }
@@ -336,6 +385,7 @@ class BackgroundScanService : Service() {
                 ErrorLogManager.logError(TAG, "BLE scan failed with code $errorCode (attempt ${bgScanRetryCount + 1}/5)")
                 scanCallback = null
                 scanner = null
+                isServiceScanning = false
                 bgScanRetryCount++
                 if (bgScanRetryCount <= 5) {
                     val backoffMs = 3000L * bgScanRetryCount
@@ -363,7 +413,7 @@ class BackgroundScanService : Service() {
             lastScanStartTime = System.currentTimeMillis()
             bgScanRetryCount = 0
             lastScanResultTime = System.currentTimeMillis()
-            startHealthCheck()
+            isServiceScanning = true
             updateNotification("Monitoring iBeacon & Eddystone")
             Log.d(TAG, "Background scan started with ${filters.size} filters")
         } catch (e: SecurityException) {
@@ -390,6 +440,19 @@ class BackgroundScanService : Service() {
                     delay(1000)
                     scanner = null
                     startBackgroundScan(forceRestart = true)
+                }
+            }
+        }
+    }
+
+    private fun startPresenceTimeoutChecker() {
+        presenceTimeoutJob?.cancel()
+        presenceTimeoutJob = scope.launch {
+            while (isActive) {
+                delay(PRESENCE_CHECK_INTERVAL_MS)
+                val timedOut = presenceTracker.checkTimeouts(PRESENCE_TIMEOUT_MS)
+                for (info in timedOut) {
+                    speak("${info.beaconName} is out of range")
                 }
             }
         }
@@ -448,6 +511,7 @@ class BackgroundScanService : Service() {
 
     private fun processResult(result: ScanResult) {
         lastScanResultTime = System.currentTimeMillis()
+        lastResultTimestamp = System.currentTimeMillis()
 
         val beacon = try {
             parserEngine.parse(result)
@@ -462,6 +526,25 @@ class BackgroundScanService : Service() {
             beacon.protocol != BeaconProtocol.EDDYSTONE_TLM &&
             beacon.protocol != BeaconProtocol.EDDYSTONE_EID) {
             return
+        }
+
+        val now = System.currentTimeMillis()
+        val existing = sharedDeviceMap[beacon.address]
+        val updatedBeacon = if (existing != null) {
+            beacon.copy(
+                firstSeen = existing.firstSeen,
+                lastSeen = now,
+                connectionState = existing.connectionState,
+                name = beacon.name ?: existing.name
+            )
+        } else {
+            beacon.copy(firstSeen = now, lastSeen = now)
+        }
+        sharedDeviceMap[beacon.address] = updatedBeacon
+        _scannedDevices.value = sharedDeviceMap.toMap()
+
+        sharedDeviceMap.entries.removeIf { (_, device) ->
+            (now - device.lastSeen) > 15_000L
         }
 
         val match = knownBeacons.find { entity ->
@@ -481,106 +564,19 @@ class BackgroundScanService : Service() {
             if (presence != null) {
                 when (presence.presenceState) {
                     PresenceState.NEARBY, PresenceState.RE_ENTERED -> {
-                        speak("${match.name} beacon in range")
+                        speak("${match.name} is in range")
                         if (match.notificationEnabled && !presence.notificationSent && cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
                             sendNearbyNotification(match.name, beacon.displayName)
                             presence.notificationSent = true
                         }
                     }
-                    else -> {}
-                }
-            }
-        } else {
-            handleRangeTracking(beacon)
-        }
-    }
-
-    private fun handleRangeTracking(device: BeaconDevice) {
-        val now = System.currentTimeMillis()
-        val rssi = device.rssi
-        trackedAddress = device.address
-
-        val beaconLabel = device.name?.takeIf { it.isNotBlank() }
-            ?: when (device.protocol) {
-                BeaconProtocol.IBEACON -> {
-                    val id = device.iBeaconUuid?.takeLast(8) ?: ""
-                    "iBeacon $id"
-                }
-                BeaconProtocol.EDDYSTONE_UID -> {
-                    val ns = device.eddystoneNamespace?.takeLast(4) ?: ""
-                    "Eddystone $ns"
-                }
-                BeaconProtocol.EDDYSTONE_URL -> device.eddystoneUrl ?: "Eddystone"
-                else -> device.protocol.name.lowercase()
-            }
-
-        when {
-            rssi >= IN_RANGE_RSSI -> {
-                outOfRangeCount = 0
-                inRangeCount++
-                if (inRangeCount >= CONFIRMATION_COUNT) {
-                    when (rangeState) {
-                        RangeState.UNKNOWN, RangeState.OUT_OF_RANGE -> {
-                            rangeState = RangeState.IN_RANGE
-                            speak("$beaconLabel in range")
-                            sendRangeNotification(device, "in range")
-                        }
-                        RangeState.TEMPORARILY_LOST -> {
-                            rangeState = RangeState.IN_RANGE
-                            confirmedLostAt = 0L
-                        }
-                        RangeState.IN_RANGE -> {}
-                    }
-                }
-            }
-            rssi <= OUT_OF_RANGE_RSSI -> {
-                inRangeCount = 0
-                outOfRangeCount++
-                if (outOfRangeCount >= CONFIRMATION_COUNT) {
-                    when (rangeState) {
-                        RangeState.IN_RANGE -> {
-                            rangeState = RangeState.TEMPORARILY_LOST
-                            confirmedLostAt = now
-                        }
-                        RangeState.TEMPORARILY_LOST -> {
-                            if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
-                                rangeState = RangeState.OUT_OF_RANGE
-                                speak("$beaconLabel out of range")
-                                sendRangeNotification(device, "out of range")
-                                resetRangeTracking()
-                            }
-                        }
-                        else -> {}
-                    }
-                }
-            }
-            else -> {
-                inRangeCount = 0
-                outOfRangeCount = 0
-                when (rangeState) {
-                    RangeState.IN_RANGE -> {
-                        rangeState = RangeState.TEMPORARILY_LOST
-                        confirmedLostAt = now
-                    }
-                    RangeState.TEMPORARILY_LOST -> {
-                        if (now - confirmedLostAt >= OUT_OF_RANGE_TIMEOUT_MS) {
-                            rangeState = RangeState.OUT_OF_RANGE
-                            speak("$beaconLabel out of range")
-                            sendRangeNotification(device, "out of range")
-                            resetRangeTracking()
-                        }
+                    PresenceState.LOST -> {
+                        speak("${match.name} is out of range")
                     }
                     else -> {}
                 }
             }
         }
-    }
-
-    private fun resetRangeTracking() {
-        inRangeCount = 0
-        outOfRangeCount = 0
-        confirmedLostAt = 0L
-        trackedAddress = null
     }
 
     private fun speak(text: String) {
@@ -625,35 +621,6 @@ class BackgroundScanService : Service() {
         }
     }
 
-    private fun sendRangeNotification(device: BeaconDevice, proximity: String) {
-        val protocolName = when (device.protocol) {
-            BeaconProtocol.IBEACON -> "iBeacon"
-            BeaconProtocol.EDDYSTONE_UID -> "Eddystone UID"
-            BeaconProtocol.EDDYSTONE_URL -> "Eddystone URL"
-            BeaconProtocol.EDDYSTONE_TLM -> "Eddystone TLM"
-            BeaconProtocol.EDDYSTONE_EID -> "Eddystone EID"
-            else -> "Beacon"
-        }
-        val details = "$protocolName $proximity (${device.rssi}dBm)"
-
-        val intent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
-            .setContentTitle("BeaconFinder")
-            .setContentText(details)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentIntent(pendingIntent)
-            .setAutoCancel(true)
-            .build()
-
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-        nm.notify(NOTIFICATION_ID_BEACON + (device.address.hashCode() and 0x7FFFFFFF), notification)
-    }
-
     private fun sendNearbyNotification(configName: String, beaconName: String) {
         val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
@@ -677,6 +644,8 @@ class BackgroundScanService : Service() {
     private fun stopBackgroundScan() {
         healthCheckJob?.cancel()
         healthCheckJob = null
+        presenceTimeoutJob?.cancel()
+        presenceTimeoutJob = null
         stopBleScan()
     }
 
@@ -687,6 +656,7 @@ class BackgroundScanService : Service() {
             Log.e(TAG, "Error stopping scan", e)
         }
         scanCallback = null
+        isServiceScanning = false
     }
 
     private fun createNotification(text: String): Notification {
@@ -727,15 +697,47 @@ class BackgroundScanService : Service() {
         private const val NOTIFICATION_ID_BEACON = 2000
         const val ACTION_START = "com.walnut.beaconfinder.START_BACKGROUND"
         const val ACTION_STOP = "com.walnut.beaconfinder.STOP_BACKGROUND"
-        private const val IN_RANGE_RSSI = -60
-        private const val OUT_OF_RANGE_RSSI = -90
-        private const val OUT_OF_RANGE_TIMEOUT_MS = 5_000L
-        private const val CONFIRMATION_COUNT = 1
         private const val TTS_COOLDOWN_MS = 3_000L
-        private const val HEALTH_CHECK_INTERVAL_MS = 10_000L
-        private const val HEALTH_CHECK_TIMEOUT_MS = 15_000L
+        private const val HEALTH_CHECK_INTERVAL_MS = 5_000L
+        private const val HEALTH_CHECK_TIMEOUT_MS = 10_000L
         private const val EDDYSTONE_SERVICE_UUID = "0000FEAA-0000-1000-8000-00805F9B34FB"
-        private const val MIN_SCAN_START_INTERVAL_MS = 15_000L
+        private const val MIN_SCAN_START_INTERVAL_MS = 5_000L
+        private const val PRESENCE_CHECK_INTERVAL_MS = 5_000L
+        private const val PRESENCE_TIMEOUT_MS = 30_000L
+
+        private val _scannedDevices = MutableStateFlow<Map<String, BeaconDevice>>(emptyMap())
+        val scannedDevices: StateFlow<Map<String, BeaconDevice>> = _scannedDevices.asStateFlow()
+
+        @Volatile
+        var isServiceScanning = false
+            private set
+
+        private val sharedDeviceMap = ConcurrentHashMap<String, BeaconDevice>()
+
+        @Volatile
+        private var lastResultTimestamp: Long = 0L
+
+        fun isScanAlive(): Boolean {
+            if (!isServiceScanning) return false
+            return System.currentTimeMillis() - lastResultTimestamp < 20_000L
+        }
+
+        fun forceRestart(context: Context) {
+            val intent = Intent(context, BackgroundScanService::class.java).apply {
+                action = ACTION_START
+            }
+            try {
+                context.startForegroundService(intent)
+            } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
+                try {
+                    context.startService(intent)
+                } catch (e2: Exception) {
+                    Log.e(TAG, "forceRestart startService fallback failed", e2)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to force restart service", e)
+            }
+        }
 
         fun start(context: Context) {
             if (Build.VERSION.SDK_INT >= 31) {
@@ -752,31 +754,30 @@ class BackgroundScanService : Service() {
                 Log.w(TAG, "Cannot start - Location permission not granted")
                 return
             }
+            val intent = Intent(context, BackgroundScanService::class.java).apply {
+                action = ACTION_START
+            }
             try {
-                val intent = Intent(context, BackgroundScanService::class.java).apply {
-                    action = ACTION_START
-                }
                 context.startForegroundService(intent)
                 Log.d(TAG, "startForegroundService succeeded")
             } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
-                Log.w(TAG, "Cannot start foreground service from background (Android 12+), retrying in 2s")
-                ErrorLogManager.logWarning(TAG, "ForegroundServiceStartNotAllowed - retrying in 2s")
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    try {
-                        val retryIntent = Intent(context, BackgroundScanService::class.java).apply {
-                            action = ACTION_START
-                        }
-                        context.startForegroundService(retryIntent)
-                        Log.d(TAG, "Retry startForegroundService succeeded")
-                    } catch (e2: Exception) {
-                        Log.e(TAG, "Retry also failed, scheduling watchdog", e2)
-                        ScanWatchdogReceiver.schedule(context)
-                    }
-                }, 2000)
+                Log.w(TAG, "ForegroundServiceStartNotAllowed (Android 12+ bg), trying startService fallback")
+                ErrorLogManager.logWarning(TAG, "ForegroundServiceStartNotAllowed - trying startService fallback")
+                try {
+                    context.startService(intent)
+                    Log.d(TAG, "startService fallback succeeded")
+                } catch (e2: Exception) {
+                    Log.e(TAG, "startService fallback also failed", e2)
+                    ErrorLogManager.logError(TAG, "startService fallback failed", e2)
+                    ScanWatchdogReceiver.schedule(context)
+                }
             } catch (e: SecurityException) {
                 Log.e(TAG, "SecurityException starting foreground service", e)
+                ErrorLogManager.logError(TAG, "SecurityException starting foreground service", e)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to start foreground service", e)
+                ErrorLogManager.logError(TAG, "Failed to start foreground service: ${e.message}", e)
+                ScanWatchdogReceiver.schedule(context)
             }
         }
 
