@@ -243,6 +243,8 @@ fun ScannerScreen(
                 }
             }
 
+            SystemStatusCard()
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -562,6 +564,76 @@ fun RssiIndicator(rssi: Int) {
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
             color = color
+        )
+    }
+}
+
+@Composable
+fun SystemStatusCard() {
+    val context = LocalContext.current
+    var btEnabled by remember { mutableStateOf(false) }
+    var locationGranted by remember { mutableStateOf(false) }
+    var batteryOptimal by remember { mutableStateOf(true) }
+    var serviceRunning by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        val btManager = context.getSystemService(android.content.Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+        btEnabled = btManager?.adapter?.isEnabled == true
+        locationGranted = context.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val pm = context.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager
+            batteryOptimal = pm?.isIgnoringBatteryOptimizations(context.packageName) == true
+        } else {
+            batteryOptimal = true
+        }
+        serviceRunning = com.walnut.beaconfinder.service.BackgroundScanService.isServiceScanning
+    }
+
+    val allGood = btEnabled && locationGranted && batteryOptimal && serviceRunning
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(8.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (allGood) Color(0xFF1B5E20).copy(alpha = 0.08f)
+            else MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+        )
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Text(
+                text = "System Status",
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp,
+                color = if (allGood) Color(0xFF1B5E20) else MaterialTheme.colorScheme.error
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            StatusItem("Bluetooth", btEnabled)
+            StatusItem("Location Permission", locationGranted)
+            StatusItem("Battery Optimization", batteryOptimal)
+            StatusItem("Background Service", serviceRunning)
+        }
+    }
+}
+
+@Composable
+fun StatusItem(label: String, ok: Boolean) {
+    Row(
+        modifier = Modifier.padding(vertical = 1.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = if (ok) "\u2713" else "\u2717",
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            color = if (ok) Color(0xFF1B5E20) else MaterialTheme.colorScheme.error
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = label,
+            fontSize = 11.sp,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
         )
     }
 }

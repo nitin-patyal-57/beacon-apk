@@ -44,6 +44,10 @@ fun SettingsScreen(
     val presenceTimeoutMs by viewModel.presenceTimeoutMs.collectAsStateWithLifecycle()
     val minRssi by viewModel.minRssi.collectAsStateWithLifecycle()
     val maxRetries by viewModel.maxRetries.collectAsStateWithLifecycle()
+    val quietHoursEnabled by viewModel.quietHoursEnabled.collectAsStateWithLifecycle()
+    val quietHoursStart by viewModel.quietHoursStart.collectAsStateWithLifecycle()
+    val quietHoursEnd by viewModel.quietHoursEnd.collectAsStateWithLifecycle()
+    val notificationRangeMeters by viewModel.notificationRangeMeters.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     var crashLog by remember { mutableStateOf("") }
@@ -351,6 +355,46 @@ fun SettingsScreen(
                     displayValue = "$minRssi dBm"
                 )
             }
+
+            // Quiet Hours
+            SettingsSection("Quiet Hours") {
+                SettingsSwitch(
+                    title = "Enable Quiet Hours",
+                    subtitle = "Suppress TTS and alerts during set hours",
+                    checked = quietHoursEnabled,
+                    onCheckedChange = { viewModel.setQuietHoursEnabled(it) }
+                )
+                if (quietHoursEnabled) {
+                    SettingsSlider(
+                        title = "Start Hour",
+                        subtitle = "Quiet period begins at this hour",
+                        value = quietHoursStart.toFloat(),
+                        valueRange = 0f..23f,
+                        onValueChange = { viewModel.setQuietHoursStart(it.toInt()) },
+                        displayValue = formatHour(quietHoursStart)
+                    )
+                    SettingsSlider(
+                        title = "End Hour",
+                        subtitle = "Quiet period ends at this hour",
+                        value = quietHoursEnd.toFloat(),
+                        valueRange = 0f..23f,
+                        onValueChange = { viewModel.setQuietHoursEnd(it.toInt()) },
+                        displayValue = formatHour(quietHoursEnd)
+                    )
+                }
+            }
+
+            // Distance Range
+            SettingsSection("Notification Range") {
+                SettingsSlider(
+                    title = "Alert Distance",
+                    subtitle = "Only alert when beacon is within this distance",
+                    value = notificationRangeMeters.toFloat(),
+                    valueRange = 1f..100f,
+                    onValueChange = { viewModel.setNotificationRangeMeters(it.toDouble()) },
+                    displayValue = String.format(java.util.Locale.US, "%.0fm", notificationRangeMeters)
+                )
+            }
         }
     }
 
@@ -522,4 +566,8 @@ private fun formatTimeout(ms: Long): String {
     } else {
         "${seconds}s"
     }
+}
+
+private fun formatHour(hour: Int): String {
+    return String.format(java.util.Locale.US, "%02d:00", hour)
 }

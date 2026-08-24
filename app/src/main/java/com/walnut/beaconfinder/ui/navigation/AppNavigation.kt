@@ -15,6 +15,7 @@ import com.walnut.beaconfinder.ui.detail.GattScreen
 import com.walnut.beaconfinder.ui.knownbeacons.KnownBeaconsScreen
 import com.walnut.beaconfinder.ui.customformats.CustomFormatsScreen
 import com.walnut.beaconfinder.ui.settings.SettingsScreen
+import com.walnut.beaconfinder.ui.alerts.AlertHistoryScreen
 
 @Composable
 fun AppNavigation(navController: NavHostController) {
@@ -89,6 +90,10 @@ fun AppNavigation(navController: NavHostController) {
 
         composable(Screen.Settings.route) {
             SettingsScreen()
+        }
+
+        composable(Screen.AlertHistory.route) {
+            AlertHistoryScreen(onBack = { navController.popBackStack() })
         }
     }
 }

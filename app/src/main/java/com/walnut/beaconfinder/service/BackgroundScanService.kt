@@ -60,6 +60,10 @@ class BackgroundScanService : Service() {
     private val presenceTracker = BeaconPresenceTracker()
     private val cooldownTracker = CooldownTracker()
     private var knownBeacons = listOf<KnownBeaconEntity>()
+    private var quietHoursEnabled = false
+    private var quietHoursStart = 22
+    private var quietHoursEnd = 7
+    private var notificationRangeMeters = 50.0
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -93,10 +97,20 @@ class BackgroundScanService : Service() {
         startHealthCheck()
         startPresenceTimeoutChecker()
         registerBtStateReceiver()
+        loadSettings()
         scope.launch {
             loadKnownBeacons()
             loadCustomFormats()
         }
+    }
+
+    private fun loadSettings() {
+        val prefs = getSharedPreferences("beacon_finder_prefs", MODE_PRIVATE)
+        quietHoursEnabled = prefs.getBoolean("quiet_hours_enabled", false)
+        quietHoursStart = prefs.getInt("quiet_hours_start", 22)
+        quietHoursEnd = prefs.getInt("quiet_hours_end", 7)
+        notificationRangeMeters = prefs.getFloat("notification_range_meters", 50f).toDouble()
+        Log.d(TAG, "Settings loaded: quietHours=$quietHoursEnabled $quietHoursStart-$quietHoursEnd, range=${notificationRangeMeters}m")
     }
 
     private fun doStartForeground() {
@@ -453,10 +467,13 @@ class BackgroundScanService : Service() {
                 delay(PRESENCE_CHECK_INTERVAL_MS)
                 val timedOut = presenceTracker.checkTimeouts(PRESENCE_TIMEOUT_MS)
                 for (info in timedOut) {
-                    speak("${info.beaconName} is out of range")
+                    if (!isQuietHours()) {
+                        speak("${info.beaconName} is out of range")
+                    }
                     if (cooldownTracker.canNotify(info.identityKey, 60_000L)) {
                         sendOutOfRangeNotification(info.beaconName, info.beaconName)
                     }
+                    logAlert(info.beaconName, info.identityKey, "UNKNOWN", "OUT_OF_RANGE", -100, -1.0)
                 }
             }
         }
@@ -576,6 +593,8 @@ class BackgroundScanService : Service() {
             else -> RssiZone.SILENT
         }
 
+        val distanceM = calculateDistance(beacon.rssi)
+
         val zoneState = rssiZoneMap.getOrPut(beacon.identityKey) { RssiZoneState() }
         val previousZone = zoneState.zone
 
@@ -585,18 +604,26 @@ class BackgroundScanService : Service() {
             when (zone) {
                 RssiZone.IN_RANGE -> {
                     if (previousZone != RssiZone.IN_RANGE) {
-                        speak("$beaconName is in range")
-                        if (cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
-                            sendNearbyNotification(beaconName, beacon.displayName)
+                        if (distanceM <= notificationRangeMeters) {
+                            if (!isQuietHours()) {
+                                speak("$beaconName is in range")
+                            }
+                            if (cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
+                                sendNearbyNotification(beaconName, beacon.displayName)
+                            }
+                            logAlert(beaconName, beacon.address, beacon.protocol.name, "IN_RANGE", beacon.rssi, distanceM)
                         }
                     }
                 }
                 RssiZone.OUT_OF_RANGE -> {
                     if (previousZone == RssiZone.IN_RANGE || previousZone == RssiZone.SILENT) {
-                        speak("$beaconName is out of range")
+                        if (!isQuietHours()) {
+                            speak("$beaconName is out of range")
+                        }
                         if (cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
                             sendOutOfRangeNotification(beaconName, beacon.displayName)
                         }
+                        logAlert(beaconName, beacon.address, beacon.protocol.name, "OUT_OF_RANGE", beacon.rssi, distanceM)
                     }
                 }
                 RssiZone.SILENT -> { }
@@ -746,6 +773,42 @@ class BackgroundScanService : Service() {
         val cleanHex = hex.replace(" ", "")
         return ByteArray(cleanHex.length / 2) { i ->
             cleanHex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+        }
+    }
+
+    private fun calculateDistance(rssi: Int): Double {
+        if (rssi == 0) return -1.0
+        val ratio = (-59.0 - rssi) / (10 * 2.0)
+        return Math.pow(10.0, ratio)
+    }
+
+    private fun isQuietHours(): Boolean {
+        if (!quietHoursEnabled) return false
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        return if (quietHoursStart <= quietHoursEnd) {
+            hour in quietHoursStart until quietHoursEnd
+        } else {
+            hour >= quietHoursStart || hour < quietHoursEnd
+        }
+    }
+
+    private fun logAlert(beaconName: String, address: String, protocol: String, type: String, rssi: Int, distance: Double) {
+        scope.launch {
+            try {
+                val db = BeaconDatabase.getInstance(applicationContext)
+                db.alertHistoryDao().insert(
+                    com.walnut.beaconfinder.data.db.AlertHistoryEntity(
+                        beaconName = beaconName,
+                        beaconAddress = address,
+                        protocol = protocol,
+                        alertType = type,
+                        rssi = rssi,
+                        distanceMeters = distance
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log alert", e)
+            }
         }
     }
 

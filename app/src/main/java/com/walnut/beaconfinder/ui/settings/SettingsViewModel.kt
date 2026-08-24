@@ -23,6 +23,10 @@ class SettingsViewModel @Inject constructor(
     val presenceTimeoutMs: StateFlow<Long> = settingsRepo.presenceTimeoutMs
     val minRssi: StateFlow<Int> = settingsRepo.minRssi
     val maxRetries: StateFlow<Int> = settingsRepo.maxRetries
+    val quietHoursEnabled: StateFlow<Boolean> = settingsRepo.quietHoursEnabled
+    val quietHoursStart: StateFlow<Int> = settingsRepo.quietHoursStart
+    val quietHoursEnd: StateFlow<Int> = settingsRepo.quietHoursEnd
+    val notificationRangeMeters: StateFlow<Double> = settingsRepo.notificationRangeMeters
 
     fun setMonitoringEnabled(enabled: Boolean) {
         settingsRepo.setMonitoringEnabled(enabled)
@@ -44,4 +48,8 @@ class SettingsViewModel @Inject constructor(
     fun setPresenceTimeoutMs(timeout: Long) = settingsRepo.setPresenceTimeoutMs(timeout)
     fun setMinRssi(rssi: Int) = settingsRepo.setMinRssi(rssi)
     fun setMaxRetries(retries: Int) = settingsRepo.setMaxRetries(retries)
+    fun setQuietHoursEnabled(enabled: Boolean) = settingsRepo.setQuietHoursEnabled(enabled)
+    fun setQuietHoursStart(hour: Int) = settingsRepo.setQuietHoursStart(hour)
+    fun setQuietHoursEnd(hour: Int) = settingsRepo.setQuietHoursEnd(hour)
+    fun setNotificationRangeMeters(meters: Double) = settingsRepo.setNotificationRangeMeters(meters)
 }

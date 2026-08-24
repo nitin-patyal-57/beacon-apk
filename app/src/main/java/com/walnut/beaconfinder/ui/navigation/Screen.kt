@@ -9,6 +9,7 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector)
     object KnownBeacons : Screen("known_beacons", "Known Beacons", Icons.Default.Star)
     object CustomFormats : Screen("custom_formats", "Custom Formats", Icons.Default.Tune)
     object Settings : Screen("settings", "Settings", Icons.Default.Settings)
+    object AlertHistory : Screen("alert_history", "Alerts", Icons.Default.History)
     object Detail : Screen("detail/{address}", "Detail", Icons.Default.Info) {
         fun createRoute(address: String) = "detail/$address"
     }
@@ -29,6 +30,6 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector)
 val bottomNavItems = listOf(
     Screen.Scanner,
     Screen.KnownBeacons,
-    Screen.CustomFormats,
+    Screen.AlertHistory,
     Screen.Settings
 )

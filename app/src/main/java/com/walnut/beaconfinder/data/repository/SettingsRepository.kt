@@ -33,6 +33,18 @@ class SettingsRepository @Inject constructor(
     private val _maxRetries = MutableStateFlow(prefs.getInt(KEY_MAX_RETRIES, 3))
     val maxRetries: StateFlow<Int> = _maxRetries.asStateFlow()
 
+    private val _quietHoursEnabled = MutableStateFlow(prefs.getBoolean(KEY_QUIET_HOURS_ENABLED, false))
+    val quietHoursEnabled: StateFlow<Boolean> = _quietHoursEnabled.asStateFlow()
+
+    private val _quietHoursStart = MutableStateFlow(prefs.getInt(KEY_QUIET_HOURS_START, 22))
+    val quietHoursStart: StateFlow<Int> = _quietHoursStart.asStateFlow()
+
+    private val _quietHoursEnd = MutableStateFlow(prefs.getInt(KEY_QUIET_HOURS_END, 7))
+    val quietHoursEnd: StateFlow<Int> = _quietHoursEnd.asStateFlow()
+
+    private val _notificationRangeMeters = MutableStateFlow(prefs.getFloat(KEY_NOTIFICATION_RANGE_METERS, 50f).toDouble())
+    val notificationRangeMeters: StateFlow<Double> = _notificationRangeMeters.asStateFlow()
+
     fun setMonitoringEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MONITORING_ENABLED, enabled).apply()
         _monitoringEnabled.value = enabled
@@ -63,6 +75,26 @@ class SettingsRepository @Inject constructor(
         _maxRetries.value = retries
     }
 
+    fun setQuietHoursEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_QUIET_HOURS_ENABLED, enabled).apply()
+        _quietHoursEnabled.value = enabled
+    }
+
+    fun setQuietHoursStart(hour: Int) {
+        prefs.edit().putInt(KEY_QUIET_HOURS_START, hour).apply()
+        _quietHoursStart.value = hour
+    }
+
+    fun setQuietHoursEnd(hour: Int) {
+        prefs.edit().putInt(KEY_QUIET_HOURS_END, hour).apply()
+        _quietHoursEnd.value = hour
+    }
+
+    fun setNotificationRangeMeters(meters: Double) {
+        prefs.edit().putFloat(KEY_NOTIFICATION_RANGE_METERS, meters.toFloat()).apply()
+        _notificationRangeMeters.value = meters
+    }
+
     companion object {
         const val PREFS_NAME = "beacon_finder_prefs"
         const val KEY_MONITORING_ENABLED = "background_monitoring_enabled"
@@ -71,5 +103,9 @@ class SettingsRepository @Inject constructor(
         const val KEY_PRESENCE_TIMEOUT_MS = "presence_timeout_ms"
         const val KEY_MIN_RSSI = "min_rssi"
         const val KEY_MAX_RETRIES = "max_retries"
+        const val KEY_QUIET_HOURS_ENABLED = "quiet_hours_enabled"
+        const val KEY_QUIET_HOURS_START = "quiet_hours_start"
+        const val KEY_QUIET_HOURS_END = "quiet_hours_end"
+        const val KEY_NOTIFICATION_RANGE_METERS = "notification_range_meters"
     }
 }
