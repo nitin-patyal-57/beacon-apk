@@ -78,6 +78,8 @@ class BackgroundScanService : Service() {
     private var lastScanStartTime: Long = 0L
     private var lastNotificationUpdate: Long = 0L
     private var lastStaleCleanup: Long = 0L
+    private var uiDirty = false
+    private var uiBatchJob: Job? = null
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
@@ -393,11 +395,17 @@ class BackgroundScanService : Service() {
 
         val filters = buildScanFilters()
         val isScreenOn = (getSystemService(Context.POWER_SERVICE) as? PowerManager)?.isInteractive == true
-        val scanMode = if (isScreenOn) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED
-        val settings = ScanSettings.Builder()
-            .setScanMode(scanMode)
-            .setReportDelay(0)
-            .build()
+        val settings = if (isScreenOn) {
+            ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setReportDelay(0)
+                .build()
+        } else {
+            ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                .setReportDelay(0)
+                .build()
+        }
 
         scanCallback = object : ScanCallback() {
             override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -454,7 +462,8 @@ class BackgroundScanService : Service() {
             bgScanRetryCount = 0
             lastScanResultTime = System.currentTimeMillis()
             isServiceScanning = true
-            Log.d(TAG, "Background scan started (${filters.size} filters, mode=$scanMode)")
+            startUiBatchUpdates()
+            Log.d(TAG, "Background scan started (${filters.size} filters, screenOn=$isScreenOn)")
         } catch (e: SecurityException) {
             Log.e(TAG, "Permission denied starting scan", e)
             ErrorLogManager.logError(TAG, "Permission denied starting BLE scan", e)
@@ -576,18 +585,20 @@ class BackgroundScanService : Service() {
         val now = System.currentTimeMillis()
 
         val existing = sharedDeviceMap[beacon.address]
-        val updatedBeacon = if (existing != null) {
-            beacon.copy(
-                firstSeen = existing.firstSeen,
-                lastSeen = now,
-                connectionState = existing.connectionState,
-                name = beacon.name ?: existing.name
-            )
+        if (existing != null) {
+            existing.lastSeen = now
+            existing.rssi = beacon.rssi
+            existing.name = beacon.name ?: existing.name
+            existing.iBeaconUuid = existing.iBeaconUuid ?: beacon.iBeaconUuid
+            existing.iBeaconMajor = existing.iBeaconMajor ?: beacon.iBeaconMajor
+            existing.iBeaconMinor = existing.iBeaconMinor ?: beacon.iBeaconMinor
+            existing.eddystoneNamespace = existing.eddystoneNamespace ?: beacon.eddystoneNamespace
+            existing.eddystoneInstance = existing.eddystoneInstance ?: beacon.eddystoneInstance
+            existing.eddystoneUrl = existing.eddystoneUrl ?: beacon.eddystoneUrl
         } else {
-            beacon.copy(firstSeen = now, lastSeen = now)
+            sharedDeviceMap[beacon.address] = beacon.copy(firstSeen = now, lastSeen = now)
         }
-        sharedDeviceMap[beacon.address] = updatedBeacon
-        _scannedDevices.value = sharedDeviceMap.toMap()
+        uiDirty = true
 
         if (now - lastStaleCleanup > STALE_CLEANUP_INTERVAL_MS) {
             lastStaleCleanup = now
@@ -804,6 +815,25 @@ class BackgroundScanService : Service() {
         }
         scanCallback = null
         isServiceScanning = false
+        stopUiBatchUpdates()
+    }
+
+    private fun startUiBatchUpdates() {
+        uiBatchJob?.cancel()
+        uiBatchJob = scope.launch {
+            while (isActive) {
+                delay(UI_BATCH_INTERVAL_MS)
+                if (uiDirty) {
+                    uiDirty = false
+                    _scannedDevices.value = sharedDeviceMap.toMap()
+                }
+            }
+        }
+    }
+
+    private fun stopUiBatchUpdates() {
+        uiBatchJob?.cancel()
+        uiBatchJob = null
     }
 
     private fun createNotification(text: String): Notification {
@@ -942,6 +972,7 @@ class BackgroundScanService : Service() {
         private const val PRESENCE_TIMEOUT_MS = 30_000L
         private const val NOTIFICATION_UPDATE_MIN_INTERVAL_MS = 5_000L
         private const val STALE_CLEANUP_INTERVAL_MS = 10_000L
+        private const val UI_BATCH_INTERVAL_MS = 200L
         private const val MAX_DEVICE_CACHE_SIZE = 100
         private const val RSSI_THRESHOLD_IN_RANGE = -60
         private const val RSSI_THRESHOLD_OUT_OF_RANGE = -90
