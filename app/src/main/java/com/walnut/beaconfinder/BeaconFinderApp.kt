@@ -11,6 +11,7 @@ import com.walnut.beaconfinder.data.ble.BluetoothStateObserver
 import com.walnut.beaconfinder.data.repository.SettingsRepository
 import com.walnut.beaconfinder.service.BackgroundScanService
 import com.walnut.beaconfinder.service.BootReceiver
+import com.walnut.beaconfinder.service.PeriodicScanWorker
 import com.walnut.beaconfinder.service.ScanWatchdogReceiver
 import dagger.hilt.android.HiltAndroidApp
 import java.io.File
@@ -19,6 +20,7 @@ import java.io.StringWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 
 @HiltAndroidApp
@@ -34,6 +36,7 @@ class BeaconFinderApp : Application() {
         setupCrashHandler()
         bluetoothStateObserver.start()
         autoStartMonitoringIfNeeded()
+        schedulePeriodicWorker()
         promptBatteryOptimization()
         promptNotificationPermission()
     }
@@ -45,6 +48,24 @@ class BeaconFinderApp : Application() {
             BackgroundScanService.start(this)
         }
         ScanWatchdogReceiver.schedule(this)
+    }
+
+    private fun schedulePeriodicWorker() {
+        val request = androidx.work.PeriodicWorkRequestBuilder<PeriodicScanWorker>(
+            15, TimeUnit.MINUTES,
+            5, TimeUnit.MINUTES
+        ).setConstraints(
+            androidx.work.Constraints.Builder()
+                .setRequiresBatteryNotLow(false)
+                .build()
+        ).build()
+
+        androidx.work.WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+            PeriodicScanWorker.WORK_NAME,
+            androidx.work.ExistingPeriodicWorkPolicy.KEEP,
+            request
+        )
+        Log.d(TAG, "PeriodicScanWorker scheduled (every 15 min)")
     }
 
     private fun promptBatteryOptimization() {
