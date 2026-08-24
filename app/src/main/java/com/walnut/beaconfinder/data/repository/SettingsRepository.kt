@@ -45,6 +45,46 @@ class SettingsRepository @Inject constructor(
     private val _notificationRangeMeters = MutableStateFlow(prefs.getFloat(KEY_NOTIFICATION_RANGE_METERS, 50f).toDouble())
     val notificationRangeMeters: StateFlow<Double> = _notificationRangeMeters.asStateFlow()
 
+    private val _darkModeEnabled = MutableStateFlow(prefs.getBoolean(KEY_DARK_MODE_ENABLED, false))
+    val darkModeEnabled: StateFlow<Boolean> = _darkModeEnabled.asStateFlow()
+
+    private val _adaptiveScanEnabled = MutableStateFlow(prefs.getBoolean(KEY_ADAPTIVE_SCAN_ENABLED, true))
+    val adaptiveScanEnabled: StateFlow<Boolean> = _adaptiveScanEnabled.asStateFlow()
+
+    private val _scanHistoryEnabled = MutableStateFlow(prefs.getBoolean(KEY_SCAN_HISTORY_ENABLED, true))
+    val scanHistoryEnabled: StateFlow<Boolean> = _scanHistoryEnabled.asStateFlow()
+
+    private val _notificationGroupingEnabled = MutableStateFlow(prefs.getBoolean(KEY_NOTIFICATION_GROUPING_ENABLED, true))
+    val notificationGroupingEnabled: StateFlow<Boolean> = _notificationGroupingEnabled.asStateFlow()
+
+    private val _leaderboardPeriodHours = MutableStateFlow(prefs.getInt(KEY_LEADERBOARD_PERIOD_HOURS, 24))
+    val leaderboardPeriodHours: StateFlow<Int> = _leaderboardPeriodHours.asStateFlow()
+
+    fun setDarkModeEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_DARK_MODE_ENABLED, enabled).apply()
+        _darkModeEnabled.value = enabled
+    }
+
+    fun setAdaptiveScanEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_ADAPTIVE_SCAN_ENABLED, enabled).apply()
+        _adaptiveScanEnabled.value = enabled
+    }
+
+    fun setScanHistoryEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SCAN_HISTORY_ENABLED, enabled).apply()
+        _scanHistoryEnabled.value = enabled
+    }
+
+    fun setNotificationGroupingEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_NOTIFICATION_GROUPING_ENABLED, enabled).apply()
+        _notificationGroupingEnabled.value = enabled
+    }
+
+    fun setLeaderboardPeriodHours(hours: Int) {
+        prefs.edit().putInt(KEY_LEADERBOARD_PERIOD_HOURS, hours).apply()
+        _leaderboardPeriodHours.value = hours
+    }
+
     fun setMonitoringEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_MONITORING_ENABLED, enabled).apply()
         _monitoringEnabled.value = enabled
@@ -107,5 +147,10 @@ class SettingsRepository @Inject constructor(
         const val KEY_QUIET_HOURS_START = "quiet_hours_start"
         const val KEY_QUIET_HOURS_END = "quiet_hours_end"
         const val KEY_NOTIFICATION_RANGE_METERS = "notification_range_meters"
+        const val KEY_DARK_MODE_ENABLED = "dark_mode_enabled"
+        const val KEY_ADAPTIVE_SCAN_ENABLED = "adaptive_scan_enabled"
+        const val KEY_SCAN_HISTORY_ENABLED = "scan_history_enabled"
+        const val KEY_NOTIFICATION_GROUPING_ENABLED = "notification_grouping_enabled"
+        const val KEY_LEADERBOARD_PERIOD_HOURS = "leaderboard_period_hours"
     }
 }

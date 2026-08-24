@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
@@ -15,6 +16,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,6 +31,8 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.walnut.beaconfinder.BeaconFinderApp
 import com.walnut.beaconfinder.ErrorLogManager
+import com.walnut.beaconfinder.service.BackgroundScanService
+import com.walnut.beaconfinder.util.ExportCsvUtil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -36,7 +40,10 @@ import java.io.File
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
-    viewModel: SettingsViewModel = hiltViewModel()
+    viewModel: SettingsViewModel = hiltViewModel(),
+    onNavigateToLeaderboard: () -> Unit = {},
+    onNavigateToProximityHistory: () -> Unit = {},
+    onNavigateToScanHistory: () -> Unit = {}
 ) {
     val monitoringEnabled by viewModel.monitoringEnabled.collectAsStateWithLifecycle()
     val notificationsEnabled by viewModel.notificationsEnabled.collectAsStateWithLifecycle()
@@ -48,6 +55,11 @@ fun SettingsScreen(
     val quietHoursStart by viewModel.quietHoursStart.collectAsStateWithLifecycle()
     val quietHoursEnd by viewModel.quietHoursEnd.collectAsStateWithLifecycle()
     val notificationRangeMeters by viewModel.notificationRangeMeters.collectAsStateWithLifecycle()
+    val darkModeEnabled by viewModel.darkModeEnabled.collectAsStateWithLifecycle()
+    val adaptiveScanEnabled by viewModel.adaptiveScanEnabled.collectAsStateWithLifecycle()
+    val scanHistoryEnabled by viewModel.scanHistoryEnabled.collectAsStateWithLifecycle()
+    val notificationGroupingEnabled by viewModel.notificationGroupingEnabled.collectAsStateWithLifecycle()
+    val leaderboardPeriodHours by viewModel.leaderboardPeriodHours.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     var crashLog by remember { mutableStateOf("") }
@@ -58,11 +70,14 @@ fun SettingsScreen(
     var logcatOutput by remember { mutableStateOf("") }
 
     var isBatteryOptimized by remember { mutableStateOf(false) }
+    var batteryLevel by remember { mutableIntStateOf(0) }
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
             isBatteryOptimized = pm?.isIgnoringBatteryOptimizations(context.packageName) != true
         }
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        batteryLevel = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 0
     }
 
     LaunchedEffect(Unit) {
@@ -394,6 +409,212 @@ fun SettingsScreen(
                     onValueChange = { viewModel.setNotificationRangeMeters(it.toDouble()) },
                     displayValue = String.format(java.util.Locale.US, "%.0fm", notificationRangeMeters)
                 )
+            }
+
+            // Appearance
+            SettingsSection("Appearance") {
+                SettingsSwitch(
+                    title = "Dark Mode",
+                    subtitle = "Use dark theme (changes apply on restart)",
+                    checked = darkModeEnabled,
+                    onCheckedChange = { viewModel.setDarkModeEnabled(it) }
+                )
+            }
+
+            // Performance
+            SettingsSection("Performance") {
+                SettingsSwitch(
+                    title = "Adaptive Scan",
+                    subtitle = "Reduce scan rate when battery is low",
+                    checked = adaptiveScanEnabled,
+                    onCheckedChange = { viewModel.setAdaptiveScanEnabled(it) }
+                )
+            }
+
+            // Notifications Advanced
+            SettingsSection("Notification Options") {
+                SettingsSwitch(
+                    title = "Group Notifications",
+                    subtitle = "Group similar beacon alerts together",
+                    checked = notificationGroupingEnabled,
+                    onCheckedChange = { viewModel.setNotificationGroupingEnabled(it) }
+                )
+            }
+
+            // Data
+            SettingsSection("Data") {
+                SettingsSwitch(
+                    title = "Scan History",
+                    subtitle = "Track all seen beacons for leaderboard",
+                    checked = scanHistoryEnabled,
+                    onCheckedChange = { viewModel.setScanHistoryEnabled(it) }
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    ),
+                    onClick = { onNavigateToLeaderboard() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Beacon Leaderboard",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Text(
+                                "Most frequently seen beacons",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                    ),
+                    onClick = { onNavigateToProximityHistory() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Time Near Beacons",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            Text(
+                                "How long you were near each beacon",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    ),
+                    onClick = { onNavigateToScanHistory() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "All Seen Beacons",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "History of every beacon detected",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Battery Status
+            SettingsSection("Battery Status") {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (batteryLevel <= 20) MaterialTheme.colorScheme.errorContainer
+                        else MaterialTheme.colorScheme.secondaryContainer
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Battery Level",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                "$batteryLevel% ${if (batteryLevel <= 20) "⚠ Low" else ""}",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Export
+            SettingsSection("Export Data") {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(4.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
+                    ),
+                    onClick = {
+                        val devices = BackgroundScanService.scannedDevices.value
+                        if (devices.isEmpty()) {
+                            Toast.makeText(context, "No scan data to export", Toast.LENGTH_SHORT).show()
+                        } else {
+                            val uri = ExportCsvUtil.exportScanResults(context, devices)
+                            if (uri != null) ExportCsvUtil.shareFile(context, uri)
+                        }
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.FileDownload,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "Export Scan Results",
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                            Text(
+                                "Export current scan data as CSV",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.7f)
+                            )
+                        }
+                    }
+                }
             }
         }
     }

@@ -17,6 +17,9 @@ import com.walnut.beaconfinder.ui.customformats.CustomFormatsScreen
 import com.walnut.beaconfinder.ui.settings.SettingsScreen
 import com.walnut.beaconfinder.ui.alerts.AlertHistoryScreen
 import com.walnut.beaconfinder.ui.zones.ZoneScreen
+import com.walnut.beaconfinder.ui.leaderboard.LeaderboardScreen
+import com.walnut.beaconfinder.ui.proximity.ProximityHistoryScreen
+import com.walnut.beaconfinder.ui.scanhistory.ScanHistoryScreen
 
 @Composable
 fun AppNavigation(navController: NavHostController) {
@@ -90,7 +93,11 @@ fun AppNavigation(navController: NavHostController) {
         }
 
         composable(Screen.Settings.route) {
-            SettingsScreen()
+            SettingsScreen(
+                onNavigateToLeaderboard = { navController.navigate(Screen.Leaderboard.route) },
+                onNavigateToProximityHistory = { navController.navigate(Screen.ProximityHistory.route) },
+                onNavigateToScanHistory = { navController.navigate(Screen.ScanHistory.route) }
+            )
         }
 
         composable(Screen.AlertHistory.route) {
@@ -99,6 +106,18 @@ fun AppNavigation(navController: NavHostController) {
 
         composable(Screen.Zones.route) {
             ZoneScreen()
+        }
+
+        composable(Screen.Leaderboard.route) {
+            LeaderboardScreen(onBack = { navController.popBackStack() })
+        }
+
+        composable(Screen.ProximityHistory.route) {
+            ProximityHistoryScreen(onBack = { navController.popBackStack() })
+        }
+
+        composable(Screen.ScanHistory.route) {
+            ScanHistoryScreen(onBack = { navController.popBackStack() })
         }
     }
 }

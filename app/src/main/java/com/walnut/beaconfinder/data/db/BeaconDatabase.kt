@@ -12,9 +12,11 @@ import androidx.room.RoomDatabase
         FavoriteEntity::class,
         BeaconNameEntity::class,
         AlertHistoryEntity::class,
-        ZoneEntity::class
+        ZoneEntity::class,
+        ScanHistoryEntity::class,
+        ProximityHistoryEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class BeaconDatabase : RoomDatabase() {
@@ -24,6 +26,8 @@ abstract class BeaconDatabase : RoomDatabase() {
     abstract fun beaconNameDao(): BeaconNameDao
     abstract fun alertHistoryDao(): AlertHistoryDao
     abstract fun zoneDao(): ZoneDao
+    abstract fun scanHistoryDao(): ScanHistoryDao
+    abstract fun proximityHistoryDao(): ProximityHistoryDao
 
     companion object {
         @Volatile

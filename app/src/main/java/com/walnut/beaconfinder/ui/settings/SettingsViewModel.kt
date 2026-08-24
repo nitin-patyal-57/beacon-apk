@@ -27,6 +27,11 @@ class SettingsViewModel @Inject constructor(
     val quietHoursStart: StateFlow<Int> = settingsRepo.quietHoursStart
     val quietHoursEnd: StateFlow<Int> = settingsRepo.quietHoursEnd
     val notificationRangeMeters: StateFlow<Double> = settingsRepo.notificationRangeMeters
+    val darkModeEnabled: StateFlow<Boolean> = settingsRepo.darkModeEnabled
+    val adaptiveScanEnabled: StateFlow<Boolean> = settingsRepo.adaptiveScanEnabled
+    val scanHistoryEnabled: StateFlow<Boolean> = settingsRepo.scanHistoryEnabled
+    val notificationGroupingEnabled: StateFlow<Boolean> = settingsRepo.notificationGroupingEnabled
+    val leaderboardPeriodHours: StateFlow<Int> = settingsRepo.leaderboardPeriodHours
 
     fun setMonitoringEnabled(enabled: Boolean) {
         settingsRepo.setMonitoringEnabled(enabled)
@@ -52,4 +57,9 @@ class SettingsViewModel @Inject constructor(
     fun setQuietHoursStart(hour: Int) = settingsRepo.setQuietHoursStart(hour)
     fun setQuietHoursEnd(hour: Int) = settingsRepo.setQuietHoursEnd(hour)
     fun setNotificationRangeMeters(meters: Double) = settingsRepo.setNotificationRangeMeters(meters)
+    fun setDarkModeEnabled(enabled: Boolean) = settingsRepo.setDarkModeEnabled(enabled)
+    fun setAdaptiveScanEnabled(enabled: Boolean) = settingsRepo.setAdaptiveScanEnabled(enabled)
+    fun setScanHistoryEnabled(enabled: Boolean) = settingsRepo.setScanHistoryEnabled(enabled)
+    fun setNotificationGroupingEnabled(enabled: Boolean) = settingsRepo.setNotificationGroupingEnabled(enabled)
+    fun setLeaderboardPeriodHours(hours: Int) = settingsRepo.setLeaderboardPeriodHours(hours)
 }

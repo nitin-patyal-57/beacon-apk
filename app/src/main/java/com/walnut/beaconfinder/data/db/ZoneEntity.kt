@@ -8,5 +8,6 @@ data class ZoneEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
     val beaconKeys: String = "[]",
-    val notificationEnabled: Boolean = true
+    val notificationEnabled: Boolean = true,
+    val soundUri: String? = null
 )

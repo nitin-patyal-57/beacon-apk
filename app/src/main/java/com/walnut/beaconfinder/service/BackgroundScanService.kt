@@ -43,6 +43,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.firstOrNull
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
@@ -68,6 +69,11 @@ class BackgroundScanService : Service() {
     private val zonePresenceMap = ConcurrentHashMap<String, MutableSet<String>>()
     private val zoneBeaconKeysCache = ConcurrentHashMap<String, List<String>>()
     private var mediaPlayer: android.media.MediaPlayer? = null
+    private var adaptiveScanEnabled = true
+    private var scanHistoryEnabled = true
+    private var notificationGroupingEnabled = true
+    private var lastScanHistorySave: Long = 0L
+    private var batteryLevel: Int = 100
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -120,7 +126,12 @@ class BackgroundScanService : Service() {
         quietHoursStart = prefs.getInt("quiet_hours_start", 22)
         quietHoursEnd = prefs.getInt("quiet_hours_end", 7)
         notificationRangeMeters = prefs.getFloat("notification_range_meters", 50f).toDouble()
-        Log.d(TAG, "Settings loaded: quietHours=$quietHoursEnabled $quietHoursStart-$quietHoursEnd, range=${notificationRangeMeters}m")
+        adaptiveScanEnabled = prefs.getBoolean("adaptive_scan_enabled", true)
+        scanHistoryEnabled = prefs.getBoolean("scan_history_enabled", true)
+        notificationGroupingEnabled = prefs.getBoolean("notification_grouping_enabled", true)
+        val bm = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        batteryLevel = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 100
+        Log.d(TAG, "Settings loaded: quietHours=$quietHoursEnabled $quietHoursStart-$quietHoursEnd, range=${notificationRangeMeters}m, adaptive=$adaptiveScanEnabled, battery=$batteryLevel%")
     }
 
     private fun doStartForeground() {
@@ -404,8 +415,13 @@ class BackgroundScanService : Service() {
                 .setReportDelay(0)
                 .build()
         } else {
+            val scanMode = if (adaptiveScanEnabled && batteryLevel <= 20) {
+                ScanSettings.SCAN_MODE_LOW_POWER
+            } else {
+                ScanSettings.SCAN_MODE_BALANCED
+            }
             ScanSettings.Builder()
-                .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
+                .setScanMode(scanMode)
                 .setReportDelay(0)
                 .build()
         }
@@ -714,6 +730,16 @@ class BackgroundScanService : Service() {
             if (cooldownTracker.canNotify(beacon.identityKey, 60_000L)) {
                 sendOutOfRangeNotification(beaconName, beacon.displayName)
             }
+            logProximityExit(beacon.address, beaconName, beacon.protocol.name)
+        }
+        if (presence != null && (presence.presenceState == PresenceState.NEARBY || presence.presenceState == PresenceState.RE_ENTERED) &&
+            presence.previousState != PresenceState.NEARBY) {
+            logProximityEnter(beacon.address, beaconName, beacon.protocol.name)
+        }
+
+        if (scanHistoryEnabled && (now - lastScanHistorySave) > 5_000L) {
+            lastScanHistorySave = now
+            logScanHistory(beacon.address, beaconName, beacon.protocol.name, beacon.rssi, distanceM)
         }
     }
 
@@ -766,14 +792,19 @@ class BackgroundScanService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
+        val builder = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
             .setContentTitle("Beacon Nearby")
             .setContentText("$configName beacon ($beaconName) is nearby")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .build()
 
+        if (notificationGroupingEnabled) {
+            builder.setGroup("beacon_alerts")
+            builder.setGroupSummary(false)
+        }
+
+        val notification = builder.build()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
         val id = NOTIFICATION_ID_BEACON + 10000 + (System.nanoTime().toInt() and 0x7FFF)
         nm.notify(id, notification)
@@ -786,14 +817,19 @@ class BackgroundScanService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
+        val builder = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
             .setContentTitle("Beacon Out of Range")
             .setContentText("$configName beacon ($beaconName) is out of range")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .build()
 
+        if (notificationGroupingEnabled) {
+            builder.setGroup("beacon_alerts")
+            builder.setGroupSummary(false)
+        }
+
+        val notification = builder.build()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
         val id = NOTIFICATION_ID_BEACON + 20000 + (System.nanoTime().toInt() and 0x7FFF)
         nm.notify(id, notification)
@@ -806,14 +842,19 @@ class BackgroundScanService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
+        val builder = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
             .setContentTitle("Zone Alert")
             .setContentText("You have $action the $zoneName zone")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .build()
 
+        if (notificationGroupingEnabled) {
+            builder.setGroup("beacon_alerts")
+            builder.setGroupSummary(false)
+        }
+
+        val notification = builder.build()
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
         val id = NOTIFICATION_ID_BEACON + 30000 + (System.nanoTime().toInt() and 0x7FFF)
         nm.notify(id, notification)
@@ -863,8 +904,10 @@ class BackgroundScanService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val battLevel = getBatteryLevel()
+
         return Notification.Builder(this, BeaconFinderApp.CHANNEL_MONITORING)
-            .setContentTitle("BeaconFinder Monitoring")
+            .setContentTitle("BeaconFinder Monitoring · $battLevel%")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentIntent(pendingIntent)
@@ -929,6 +972,9 @@ class BackgroundScanService : Service() {
                     if (cooldownTracker.canNotify("zone:${zone.name}", 60_000L)) {
                         sendZoneNotification(zone.name, "entered")
                     }
+                    if (zone.soundUri != null) {
+                        playCustomSound(zone.soundUri)
+                    }
                 }
             }
         }
@@ -938,6 +984,66 @@ class BackgroundScanService : Service() {
         if (rssi == 0) return -1.0
         val ratio = (-59.0 - rssi) / (10 * 2.0)
         return Math.pow(10.0, ratio)
+    }
+
+    private fun logScanHistory(address: String, name: String, protocol: String, rssi: Int, distance: Double) {
+        scope.launch {
+            try {
+                val db = BeaconDatabase.getInstance(applicationContext)
+                db.scanHistoryDao().insert(
+                    com.walnut.beaconfinder.data.db.ScanHistoryEntity(
+                        beaconAddress = address,
+                        beaconName = name,
+                        protocol = protocol,
+                        rssi = rssi,
+                        distanceMeters = distance
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log scan history", e)
+            }
+        }
+    }
+
+    private fun logProximityEnter(address: String, name: String, protocol: String) {
+        scope.launch {
+            try {
+                val db = BeaconDatabase.getInstance(applicationContext)
+                db.proximityHistoryDao().insert(
+                    com.walnut.beaconfinder.data.db.ProximityHistoryEntity(
+                        beaconAddress = address,
+                        beaconName = name,
+                        protocol = protocol,
+                        enterTime = System.currentTimeMillis()
+                    )
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log proximity enter", e)
+            }
+        }
+    }
+
+    private fun logProximityExit(address: String, name: String, protocol: String) {
+        scope.launch {
+            try {
+                val db = BeaconDatabase.getInstance(applicationContext)
+                val recent = db.proximityHistoryDao().getByAddress(address).firstOrNull()?.firstOrNull()
+                if (recent != null && recent.exitTime == 0L) {
+                    val totalTime = System.currentTimeMillis() - recent.enterTime
+                    db.proximityHistoryDao().update(recent.copy(
+                        exitTime = System.currentTimeMillis(),
+                        totalTimeMs = totalTime
+                    ))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to log proximity exit", e)
+            }
+        }
+    }
+
+    private fun getBatteryLevel(): Int {
+        val bm = getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+        return bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: 0
     }
 
     private fun isQuietHours(): Boolean {
