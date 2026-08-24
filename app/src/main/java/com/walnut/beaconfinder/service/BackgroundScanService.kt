@@ -77,6 +77,7 @@ class BackgroundScanService : Service() {
     private var audioFocusRequest: AudioFocusRequest? = null
 
     private var btStateReceiver: BroadcastReceiver? = null
+    private val rssiZoneMap = ConcurrentHashMap<String, RssiZoneState>()
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -453,6 +454,9 @@ class BackgroundScanService : Service() {
                 val timedOut = presenceTracker.checkTimeouts(PRESENCE_TIMEOUT_MS)
                 for (info in timedOut) {
                     speak("${info.beaconName} is out of range")
+                    if (cooldownTracker.canNotify(info.identityKey, 60_000L)) {
+                        sendOutOfRangeNotification(info.beaconName, info.beaconName)
+                    }
                 }
             }
         }
@@ -529,6 +533,7 @@ class BackgroundScanService : Service() {
         }
 
         val now = System.currentTimeMillis()
+
         val existing = sharedDeviceMap[beacon.address]
         val updatedBeacon = if (existing != null) {
             beacon.copy(
@@ -559,22 +564,55 @@ class BackgroundScanService : Service() {
             }
         }
 
-        if (match != null) {
-            val presence = presenceTracker.updatePresence(beacon, match.presenceTimeoutMs, match.minRssi)
-            if (presence != null) {
-                when (presence.presenceState) {
-                    PresenceState.NEARBY, PresenceState.RE_ENTERED -> {
-                        speak("${match.name} is in range")
-                        if (match.notificationEnabled && !presence.notificationSent && cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
-                            sendNearbyNotification(match.name, beacon.displayName)
-                            presence.notificationSent = true
+        val beaconName = match?.name ?: when (beacon.protocol) {
+            BeaconProtocol.IBEACON -> "Unknown iBeacon"
+            BeaconProtocol.EDDYSTONE_UID -> "Unknown Eddystone"
+            else -> "Unknown beacon"
+        }
+
+        val zone = when {
+            beacon.rssi >= RSSI_THRESHOLD_IN_RANGE -> RssiZone.IN_RANGE
+            beacon.rssi <= RSSI_THRESHOLD_OUT_OF_RANGE -> RssiZone.OUT_OF_RANGE
+            else -> RssiZone.SILENT
+        }
+
+        val zoneState = rssiZoneMap.getOrPut(beacon.identityKey) { RssiZoneState() }
+        val previousZone = zoneState.zone
+
+        if (zone != previousZone) {
+            zoneState.zone = zone
+
+            when (zone) {
+                RssiZone.IN_RANGE -> {
+                    if (previousZone != RssiZone.IN_RANGE) {
+                        speak("$beaconName is in range")
+                        if (cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
+                            sendNearbyNotification(beaconName, beacon.displayName)
                         }
                     }
-                    PresenceState.LOST -> {
-                        speak("${match.name} is out of range")
-                    }
-                    else -> {}
                 }
+                RssiZone.OUT_OF_RANGE -> {
+                    if (previousZone == RssiZone.IN_RANGE || previousZone == RssiZone.SILENT) {
+                        speak("$beaconName is out of range")
+                        if (cooldownTracker.canNotify(beacon.identityKey, 30_000L)) {
+                            sendOutOfRangeNotification(beaconName, beacon.displayName)
+                        }
+                    }
+                }
+                RssiZone.SILENT -> { }
+            }
+        }
+
+        val presence = presenceTracker.updatePresence(
+            beacon,
+            timeoutMs = match?.presenceTimeoutMs ?: PRESENCE_TIMEOUT_MS,
+            minRssi = match?.minRssi ?: Int.MIN_VALUE
+        )
+        if (presence != null && presence.presenceState == PresenceState.LOST &&
+            presence.previousState != PresenceState.LOST) {
+            speak("$beaconName is out of range")
+            if (cooldownTracker.canNotify(beacon.identityKey, 60_000L)) {
+                sendOutOfRangeNotification(beaconName, beacon.displayName)
             }
         }
     }
@@ -641,6 +679,26 @@ class BackgroundScanService : Service() {
         nm.notify(id, notification)
     }
 
+    private fun sendOutOfRangeNotification(configName: String, beaconName: String) {
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = Notification.Builder(this, BeaconFinderApp.CHANNEL_NEARBY)
+            .setContentTitle("Beacon Out of Range")
+            .setContentText("$configName beacon ($beaconName) is out of range")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val id = NOTIFICATION_ID_BEACON + 20000 + (System.nanoTime().toInt() and 0x7FFF)
+        nm.notify(id, notification)
+    }
+
     private fun stopBackgroundScan() {
         healthCheckJob?.cancel()
         healthCheckJob = null
@@ -691,6 +749,13 @@ class BackgroundScanService : Service() {
         }
     }
 
+    enum class RssiZone { IN_RANGE, SILENT, OUT_OF_RANGE }
+
+    data class RssiZoneState(
+        var zone: RssiZone = RssiZone.SILENT,
+        var lastAlertTime: Long = 0L
+    )
+
     companion object {
         const val TAG = "BackgroundScanService"
         const val NOTIFICATION_ID = 1001
@@ -704,6 +769,8 @@ class BackgroundScanService : Service() {
         private const val MIN_SCAN_START_INTERVAL_MS = 5_000L
         private const val PRESENCE_CHECK_INTERVAL_MS = 5_000L
         private const val PRESENCE_TIMEOUT_MS = 30_000L
+        private const val RSSI_THRESHOLD_IN_RANGE = -60
+        private const val RSSI_THRESHOLD_OUT_OF_RANGE = -90
 
         private val _scannedDevices = MutableStateFlow<Map<String, BeaconDevice>>(emptyMap())
         val scannedDevices: StateFlow<Map<String, BeaconDevice>> = _scannedDevices.asStateFlow()
